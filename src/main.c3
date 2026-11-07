@@ -1,3 +1,4 @@
+// Tabla: a blank page that never runs out of room.
 module tabla;
 import tabla::app, tabla::input, tabla::clip, raylib55::rl;
 import std::io, std::os::env, std::io::path;
