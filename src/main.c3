@@ -19,12 +19,12 @@ fn String default_board_path() @local
 	return dir.tconcat("/board.tabla");
 }
 
-fn int run_app(String path, RLConfigFlag extra_flags = (RLConfigFlag)0) @local
+fn int run_app(String[] paths, RLConfigFlag extra_flags = (RLConfigFlag)0) @local
 {
 	rl::set_trace_log_level(ERROR);
 	rl::set_config_flags(RLConfigFlag.MSAA_4X_HINT | RLConfigFlag.WINDOW_RESIZABLE | RLConfigFlag.VSYNC_HINT | extra_flags);
 	rl::init_window(1360, 860, "Tabla");
-	rl::set_window_min_size(860, 640);
+	rl::set_window_min_size(860, 670);
 	rl::set_exit_key(NONE);
 	input::hook_pointer_trail();
 	$if $feat(E2E):
@@ -35,10 +35,14 @@ fn int run_app(String path, RLConfigFlag extra_flags = (RLConfigFlag)0) @local
 	App* a = mem::new(App);
 	@pool()
 	{
-		a.init(path);
+		a.init(paths[0]);
+		foreach (path : paths[1..]) a.open_or_create(path);
 	};
-	while (!rl::window_should_close() && !a.quit)
+	while (true)
 	{
+		// raylib clears the request each frame, so a quit that was held back can go on.
+		if (rl::window_should_close()) a.request_quit();
+		if (a.quit) break;
 		input::read(&a.input);
 		a.frame();
 	}
@@ -51,17 +55,18 @@ fn int main(String[] args)
 {
 	if (args.len > 1 && (args[1] == "--help" || args[1] == "-h"))
 	{
-		io::printn("usage: tabla [board.tabla]");
-		io::printn("Without a file, tabla opens your default board.");
+		io::printn("usage: tabla [board.tabla ...]");
+		io::printn("Each board opens in its own tab, up to 5. Without a file, tabla opens your default board.");
 		return 0;
 	}
 	$if $feat(E2E):
 		if (args.len > 2 && args[1] == "--e2e") return run_e2e(args[2]);
-		if (args.len > 2 && args[1] == "--hidden") return run_app(args[2], RLConfigFlag.WINDOW_HIDDEN);
+		if (args.len > 2 && args[1] == "--hidden") return run_app(args[2..], RLConfigFlag.WINDOW_HIDDEN);
 		if (args.len > 3 && args[1] == "--perf") return run_perf(args[2], args[3].to_int()!!);
 	$endif
 	@pool()
 	{
-		return run_app(args.len > 1 ? args[1] : default_board_path());
+		String[1] fallback = { default_board_path() };
+		return run_app(args.len > 1 ? args[1..] : &fallback);
 	};
 }

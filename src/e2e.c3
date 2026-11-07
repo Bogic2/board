@@ -6,6 +6,8 @@ import tabla::app, tabla::board, tabla::geom, tabla::input, tabla::render, tabla
 import raylib55::rl;
 import std::io, std::math, std::os::env, std::collections::list;
 
+extern fn CInt c_symlink(ZString target, ZString link) @cname("symlink");
+
 struct Script
 {
 	App* a;
@@ -46,6 +48,7 @@ fn void Script.step(&self)
 	in.pressed = {};
 	in.first_press = {};
 	in.letters = {};
+	in.first_letters = {};
 	in.char_count = 0;
 	in.trail_count = 0;
 	in.delta = { 0, 0 };
@@ -119,6 +122,7 @@ fn void Script.letter(&self, char c, bool ctrl = false, bool shift = false)
 {
 	Input* in = &self.a.input;
 	in.letters[c - 'a'] = true;
+	in.first_letters[c - 'a'] = true;
 	in.ctrl = ctrl;
 	in.shift = shift;
 	self.step();
@@ -150,6 +154,69 @@ fn void Script.wheel(&self, Vec2 at, float amount)
 
 fn String Script.file(&self, String name) => string::format(mem, "%s/%s", self.dir, name);
 
+fn String Script.fresh(&self, String name)
+{
+	String path = self.file(name);
+	(void)file::delete(path);
+	return path;
+}
+
+// Closes the board and loads it back from its file, the way a new session would.
+fn void Script.reopen(&self)
+{
+	App* a = self.a;
+	Tab* board = a.tab;
+	String path = board.path.copy(mem);
+	a.new_board(self.fresh("reopen-spare.tabla"));
+	Tab* spare = a.tab;
+	self.check(a.close_tab(board), "closing a board to reopen it");
+	self.check(a.open(path), "reopening it");
+	self.check(a.close_tab(spare), "closing the spare tab");
+	free(path);
+}
+
+fn Vec2 Script.tab_at(&self, int index)
+{
+	Ui* u = &self.a.ui;
+	return { u.tab_strip.x + 6 + u.tab_width * (index + 0.5f), u.tab_strip.y + 5 + ui::BUTTON * 0.5f };
+}
+
+fn Vec2 Script.tab_cross(&self, int index)
+{
+	Ui* u = &self.a.ui;
+	return { u.tab_strip.x + 6 + u.tab_width * (float)(index + 1) - 16, u.tab_strip.y + 5 + ui::BUTTON * 0.5f };
+}
+
+fn void Script.ctrl_key(&self, RLKeyboardKey key, bool shift = false)
+{
+	Input* in = &self.a.input;
+	in.ctrl = true;
+	in.shift = shift;
+	in.first_press[(int)key] = true;
+	self.tap(key);
+	in.ctrl = false;
+	in.shift = false;
+}
+
+fn sz Script.saved_items(&self, String path)
+{
+	Board check;
+	check.init();
+	defer check.free();
+	if (catch store::load(&check, path)) return -1;
+	return check.items.len();
+}
+
+fn void Script.wait_for_dialog(&self)
+{
+	for (int i = 0; i < 400 && dialog::is_open(); i++)
+	{
+		self.step();
+		rl::wait_time(0.005);
+	}
+	self.step();
+}
+
 fn void Script.shot(&self, String name)
 {
 	self.a.capture_path = self.file(name);
@@ -159,14 +226,14 @@ fn void Script.shot(&self, String name)
 fn int Script.count(&self, ItemKind kind)
 {
 	int n = 0;
-	foreach (item : self.a.board.items)
+	foreach (item : self.a.tab.board.items)
 	{
 		if (!item.dead && item.kind == kind) n++;
 	}
 	return n;
 }
 
-fn Item* Script.top(&self) => self.a.board.items[self.a.board.items.len() - 1];
+fn Item* Script.top(&self) => self.a.tab.board.items[self.a.tab.board.items.len() - 1];
 
 fn void make_test_picture(ZString path, RLColor sky)
 {
@@ -243,14 +310,14 @@ fn void Script.test_undo_of_everything(&self)
 {
 	self.section("undo and redo");
 	App* a = self.a;
-	sz items = a.board.items.len();
-	sz steps = a.board.undo_steps.len();
+	sz items = a.tab.board.items.len();
+	sz steps = a.tab.board.undo_steps.len();
 	for (sz i = 0; i < steps; i++) a.undo();
 	self.step();
-	self.check(a.board.items.len() == 0, "undoing everything empties the board");
+	self.check(a.tab.board.items.len() == 0, "undoing everything empties the board");
 	for (sz i = 0; i < steps; i++) a.redo();
 	self.step();
-	self.check(a.board.items.len() == items, "redo brings everything back");
+	self.check(a.tab.board.items.len() == items, "redo brings everything back");
 }
 
 fn void Script.test_shapes(&self)
@@ -259,9 +326,9 @@ fn void Script.test_shapes(&self)
 	App* a = self.a;
 	Input* in = &a.input;
 	a.tool = LINE;
-	sz before = a.board.items.len();
+	sz before = a.tab.board.items.len();
 	self.drag({ 240, 620 }, { 400, 720 });
-	self.check(a.board.items.len() == before + 1, "line");
+	self.check(a.tab.board.items.len() == before + 1, "line");
 	a.tool = ARROW;
 	self.drag({ 430, 620 }, { 590, 720 });
 	self.check(self.top().ink.points.len == 5, "arrow has a head");
@@ -280,9 +347,9 @@ fn void Script.test_shapes(&self)
 	DVec2 size = box.size();
 	self.near(size.x, size.y, "shift makes a square");
 
-	before = a.board.items.len();
+	before = a.tab.board.items.len();
 	self.click({ 1150, 700 });
-	self.check(a.board.items.len() == before, "a click makes no shape");
+	self.check(a.tab.board.items.len() == before, "a click makes no shape");
 	self.shot("02-shapes.png");
 }
 
@@ -290,7 +357,7 @@ fn void Script.test_pictures(&self)
 {
 	self.section("pictures: add, draw on, move, resize");
 	App* a = self.a;
-	Board* b = &a.board;
+	Board* b = &a.tab.board;
 	String path = self.file("picture.png");
 	make_test_picture(path.zstr_tcopy(), { 90, 160, 220, 255 });
 
@@ -341,8 +408,8 @@ fn void Script.test_pictures(&self)
 	double old_scale = p.scale;
 	double old_ink_scale = i.scale;
 	DRect box = p.bounds();
-	Vec2 corner = a.cam.to_screen(box.hi);
-	Vec2 lo = a.cam.to_screen(box.lo);
+	Vec2 corner = a.tab.cam.to_screen(box.hi);
+	Vec2 lo = a.tab.cam.to_screen(box.lo);
 	self.drag(corner, lo + (corner - lo) * 1.5f);
 	p = b.get(picture_id)!!;
 	i = b.get(ink_id)!!;
@@ -401,26 +468,26 @@ fn void Script.test_eraser(&self)
 	a.tool = LINE;
 	a.styles[Tool.LINE.ordinal].size = 8;
 	self.drag({ 300, 300 }, { 900, 300 });
-	sz before = a.board.items.len();
+	sz before = a.tab.board.items.len();
 	uint line_id = self.top().id;
 	a.tool = ERASER;
 	self.drag({ 600, 220 }, { 600, 380 });
-	self.check(a.board.items.len() == before + 1, "eraser cuts the line in two");
-	self.check(!a.board.by_id.has_key(line_id), "the original was replaced");
-	sz steps = a.board.undo_steps.len();
+	self.check(a.tab.board.items.len() == before + 1, "eraser cuts the line in two");
+	self.check(!a.tab.board.by_id.has_key(line_id), "the original was replaced");
+	sz steps = a.tab.board.undo_steps.len();
 	self.shot("06-erased.png");
 	a.undo();
 	self.step();
-	self.check(a.board.by_id.has_key(line_id) && a.board.items.len() == before, "one undo restores the whole line");
+	self.check(a.tab.board.by_id.has_key(line_id) && a.tab.board.items.len() == before, "one undo restores the whole line");
 	a.redo();
 	self.step();
-	self.check(a.board.undo_steps.len() == steps, "redo reapplies the cut");
+	self.check(a.tab.board.undo_steps.len() == steps, "redo reapplies the cut");
 
 	Input* in = &a.input;
 	in.shift = true;
 	self.drag({ 400, 250 }, { 400, 350 });
 	in.shift = false;
-	self.check(a.board.items.len() == before, "Shift erases whole strokes");
+	self.check(a.tab.board.items.len() == before, "Shift erases whole strokes");
 	a.undo();
 	a.styles[Tool.LINE.ordinal].size = 3;
 	self.step();
@@ -442,7 +509,7 @@ fn void Script.test_text(&self)
 	self.type("Šđčćž Ś Ź");
 	self.tap(ENTER);
 	self.type("Ćirilica: Љубав њежна");
-	Item* text = a.board.get(a.edit_id)!!;
+	Item* text = a.tab.board.get(a.edit_id)!!;
 	uint text_id = text.id;
 	self.tap(BACKSPACE);
 	self.type("a!");
@@ -455,36 +522,36 @@ fn void Script.test_text(&self)
 	self.shot("07-typing.png");
 	self.tap(ESCAPE);
 	self.check(a.edit_id == 0, "Escape finishes");
-	self.check(a.board.get(text_id)!!.text.text == "Šđčćž Ś Ź\nĆirilica: Љубав њежa!", "text is stored");
-	self.check(a.board.undo_steps.len() > 0, "text is undoable");
+	self.check(a.tab.board.get(text_id)!!.text.text == "Šđčćž Ś Ź\nĆirilica: Љубав њежa!", "text is stored");
+	self.check(a.tab.board.undo_steps.len() > 0, "text is undoable");
 
 	a.tool = TEXT;
-	sz before = a.board.items.len();
+	sz before = a.tab.board.items.len();
 	self.click({ 700, 500 });
 	self.tap(ESCAPE);
-	self.check(a.board.items.len() == before, "empty text leaves nothing behind");
+	self.check(a.tab.board.items.len() == before, "empty text leaves nothing behind");
 
 	// Clicking away ends the typing, and only that.
 	a.tool = TEXT;
-	before = a.board.items.len();
+	before = a.tab.board.items.len();
 	self.click({ 900, 600 });
 	self.type("gone soon");
 	self.click({ 950, 700 });
 	self.check(a.edit_id == 0, "clicking away ends typing");
-	self.check(a.board.items.len() == before + 1, "and does not start another text");
+	self.check(a.tab.board.items.len() == before + 1, "and does not start another text");
 	a.undo();
 	self.step();
 
 	a.tool = NOTE;
 	self.click({ 400, 480 });
 	self.type("Sticky notes wrap their text automatically when a line gets long. They also grow when they run out of room, as this one does because it has quite a lot to say about itself.");
-	Item* note = a.board.get(a.edit_id)!!;
+	Item* note = a.tab.board.get(a.edit_id)!!;
 	uint note_id = note.id;
 	self.check(note.size.y > app::NOTE_SIZE, "a note grows with its text");
 	self.tap(ESCAPE);
 
 	a.tool = SELECT;
-	Vec2 on_note = a.cam.to_screen(a.board.get(note_id)!!.pos) + (Vec2){ 30, 30 };
+	Vec2 on_note = a.tab.cam.to_screen(a.tab.board.get(note_id)!!.pos) + (Vec2){ 30, 30 };
 	self.click(on_note);
 	self.check(a.is_selected(note_id), "notes are selectable");
 	a.input.time += 1; // the next click is not a double click
@@ -510,23 +577,23 @@ fn void Script.test_zoom(&self)
 	a.reset_view();
 	self.step();
 	Vec2 mouse = { 500, 300 };
-	DVec2 before = a.cam.to_world(mouse);
+	DVec2 before = a.tab.cam.to_world(mouse);
 	self.wheel(mouse, 6);
-	self.check(a.cam.zoom > 2.5, "wheel zooms in");
-	DVec2 after = a.cam.to_world(mouse);
+	self.check(a.tab.cam.zoom > 2.5, "wheel zooms in");
+	DVec2 after = a.tab.cam.to_world(mouse);
 	self.near(after.x, before.x, "the spot under the mouse stays put (x)");
 	self.near(after.y, before.y, "the spot under the mouse stays put (y)");
 
 	// Far from the origin the coordinates are enormous, and a stroke must still be exact.
-	a.cam = { .origin = { 4e12, -7e12 }, .zoom = 3000 };
-	a.cam_target = a.cam;
+	a.tab.cam = { .origin = { 4e12, -7e12 }, .zoom = 3000 };
+	a.tab.cam_target = a.tab.cam;
 	a.tool = PEN;
 	a.styles[Tool.PEN.ordinal].size = 6;
 	Vec2[*] zig = { { 300, 300 }, { 400, 200 }, { 500, 300 }, { 600, 200 }, { 700, 300 }, { 800, 200 } };
 	self.scribble(&zig);
 	Item* far_ink = self.top();
 	self.check(far_ink.pos.x > 3.9e12, "the stroke lives far away");
-	self.near(far_ink.ink.points[0].w * far_ink.scale * a.cam.zoom, 6.0, "pen width is in screen pixels");
+	self.near(far_ink.ink.points[0].w * far_ink.scale * a.tab.cam.zoom, 6.0, "pen width is in screen pixels");
 	self.move_to({ 1100, 700 });
 	self.shot("09-far-away.png");
 	@pool()
@@ -538,14 +605,14 @@ fn void Script.test_zoom(&self)
 	a.styles[Tool.PEN.ordinal].size = 3;
 
 	// Going down the scale: draw at tiny size inside a huge zoom-in.
-	a.cam = { .origin = { 100, 100 }, .zoom = 50000 };
-	a.cam_target = a.cam;
+	a.tab.cam = { .origin = { 100, 100 }, .zoom = 50000 };
+	a.tab.cam_target = a.tab.cam;
 	self.step();
 	self.shot("10-deep-zoom.png");
 
 	a.fit_all();
 	self.settle_camera();
-	self.check(a.cam.zoom < 1, "fit reaches everything");
+	self.check(a.tab.cam.zoom < 1, "fit reaches everything");
 	self.shot("11-fit-all.png");
 	a.reset_view();
 	self.step();
@@ -555,7 +622,7 @@ fn void Script.test_copy_paste(&self)
 {
 	self.section("copy, paste, duplicate");
 	App* a = self.a;
-	Board* b = &a.board;
+	Board* b = &a.tab.board;
 
 	// Find the picture with ink on it.
 	Item* picture = null;
@@ -604,29 +671,29 @@ fn void Script.test_save_and_load(&self)
 {
 	self.section("save and load");
 	App* a = self.a;
-	a.cam = { .origin = { 77, -33 }, .zoom = 0.5 };
-	a.cam_target = a.cam;
-	a.paper = 1;
-	a.pattern = 1;
+	a.tab.cam = { .origin = { 77, -33 }, .zoom = 0.5 };
+	a.tab.cam_target = a.tab.cam;
+	a.tab.paper = 1;
+	a.tab.pattern = 1;
 	self.step();
-	sz items = self.a.board.items.len();
-	sz assets = a.board.assets.len();
+	sz items = self.a.tab.board.items.len();
+	sz assets = a.tab.board.assets.len();
 	self.check(a.save_now(true), "saving");
-	self.check(!a.has_unsaved(), "nothing left to save");
+	self.check(!a.tab.has_unsaved(), "nothing left to save");
 
-	String path = a.path.copy(mem);
-	a.open(path);
+	String path = a.tab.path.copy(mem);
+	self.reopen();
 	self.step();
-	self.check(a.board.items.len() == items, "items come back");
-	self.check(a.board.assets.len() == assets, "pictures come back");
-	self.near(a.cam.origin.x, 77, "the view comes back");
-	self.near(a.cam.zoom, 0.5, "the zoom comes back");
-	self.check(a.paper == 1 && a.pattern == 1, "paper style comes back");
+	self.check(a.tab.board.items.len() == items, "items come back");
+	self.check(a.tab.board.assets.len() == assets, "pictures come back");
+	self.near(a.tab.cam.origin.x, 77, "the view comes back");
+	self.near(a.tab.cam.zoom, 0.5, "the zoom comes back");
+	self.check(a.tab.paper == 1 && a.tab.pattern == 1, "paper style comes back");
 
 	// Pictures are decoded on demand, one per frame, from the bytes inside the file.
-	DRect pictures = a.board.items[0].bounds();
+	DRect pictures = a.tab.board.items[0].bounds();
 	bool first = true;
-	foreach (item : a.board.items)
+	foreach (item : a.tab.board.items)
 	{
 		if (item.kind != IMAGE) continue;
 		pictures = first ? item.bounds() : pictures.merge(item.bounds());
@@ -636,7 +703,7 @@ fn void Script.test_save_and_load(&self)
 	self.settle_camera();
 	for (int i = 0; i < 4; i++) self.step();
 	bool all_ready = true;
-	foreach (asset : a.board.assets)
+	foreach (asset : a.tab.board.assets)
 	{
 		if (asset.state != READY) all_ready = false;
 	}
@@ -647,31 +714,31 @@ fn void Script.test_save_and_load(&self)
 	String bad = self.file("broken.tabla");
 	file::save(bad, "TABLA and then nonsense")!!;
 	a.open(bad);
-	self.check(a.board.items.len() == items, "a broken file leaves the open board alone");
-	self.check(a.path == path, "and the board keeps its own file");
+	self.check(a.tab.board.items.len() == items, "a broken file leaves the open board alone");
+	self.check(a.tab.path == path, "and the board keeps its own file");
 	self.check((String)file::load_temp(bad)!! == "TABLA and then nonsense", "the broken file is untouched");
 
 	// Autosave: change something, go idle, and the file catches up by itself.
 	a.tool = PEN;
 	self.scribble((Vec2[]){ { 300, 300 }, { 340, 340 } });
-	self.check(a.has_unsaved(), "new ink is not saved yet");
+	self.check(a.tab.has_unsaved(), "new ink is not saved yet");
 	for (int i = 0; i < 90; i++) self.step();
-	self.check(!a.has_unsaved(), "autosave ran after a short pause");
+	self.check(!a.tab.has_unsaved(), "autosave ran after a short pause");
 	Board check;
 	check.init();
 	defer check.free();
 	(void)store::load(&check, path);
 	self.check(check.items.len() == items + 1, "the autosaved file has the new stroke");
-	a.paper = 0;
-	a.pattern = 0;
+	a.tab.paper = 0;
+	a.tab.pattern = 0;
 }
 
 fn void Script.test_export(&self)
 {
 	self.section("export");
 	App* a = self.a;
-	Board* b = &a.board;
-	a.paper = 0;
+	Board* b = &a.tab.board;
+	a.tab.paper = 0;
 	Item* picture = null;
 	foreach (item : b.items)
 	{
@@ -690,7 +757,7 @@ fn void Script.test_export(&self)
 	a.tool = HIGHLIGHTER;
 	Vec2[*] across = { { 300, 560 }, { 700, 560 } };
 	self.scribble(&across);
-	DVec2 highlighted = a.cam.to_world({ 600, 560 });
+	DVec2 highlighted = a.tab.cam.to_world({ 600, 560 });
 	a.tool = SELECT;
 
 	a.selection.clear();
@@ -733,8 +800,8 @@ fn void Script.test_export(&self)
 	Vec2[*] loop = { { 300, 300 }, { 800, 300 }, { 800, 500 }, { 500, 500 }, { 500, 150 } };
 	self.scribble(&loop);
 	Item* ink = self.top();
-	DVec2 crossing = a.cam.to_world({ 500, 300 });
-	DVec2 single = a.cam.to_world({ 650, 300 });
+	DVec2 crossing = a.tab.cam.to_world({ 500, 300 });
+	DVec2 single = a.tab.cam.to_world({ 650, 300 });
 	a.tool = SELECT;
 	a.selection.clear();
 	a.selection.push(ink.id);
@@ -795,7 +862,7 @@ fn void Script.test_picture_files(&self)
 	String[1] one = { renamed };
 	a.add_files(&one, { 640, 400 });
 	self.step();
-	self.check(a.board.assets.len() >= 2, "a misnamed picture is recognised");
+	self.check(a.tab.board.assets.len() >= 2, "a misnamed picture is recognised");
 	self.check(self.count(IMAGE) == pictures + 1, "misnamed picture added");
 
 	String webp = self.file("photo.webp");
@@ -833,8 +900,8 @@ fn void Script.test_picture_files(&self)
 	Item* photo = self.top();
 	self.check(photo.kind == IMAGE, "the JPEG is added");
 	self.check(photo.asset.width == 100 && photo.asset.height == 200, "a sideways photo is stood upright");
-	Vec2 lo = a.cam.to_screen(photo.bounds().lo);
-	Vec2 hi = a.cam.to_screen(photo.bounds().hi);
+	Vec2 lo = a.tab.cam.to_screen(photo.bounds().lo);
+	Vec2 hi = a.tab.cam.to_screen(photo.bounds().hi);
 	a.selection.clear();
 	self.move_to({ 1200, 700 });
 	self.shot("14-rotated.png");
@@ -851,17 +918,16 @@ fn void Script.test_picture_files(&self)
 	// The orientation must survive saving: the bytes keep it, not the texture.
 	self.check(a.save_now(true), "saving the photo");
 	uint photo_id = photo.id;
-	String path = a.path.copy(mem);
-	a.open(path);
-	Item* reloaded = a.board.get(photo_id)!!;
+	self.reopen();
+	Item* reloaded = a.tab.board.get(photo_id)!!;
 	self.check(reloaded.asset.state == UNLOADED, "pictures are decoded lazily after loading");
 	a.fit_view(reloaded.bounds());
-	a.cam = a.cam_target;
+	a.tab.cam = a.tab.cam_target;
 	self.step();
 	self.step();
 	self.check(reloaded.asset.state == READY, "the reloaded photo decodes once visible");
-	lo = a.cam.to_screen(reloaded.bounds().lo);
-	hi = a.cam.to_screen(reloaded.bounds().hi);
+	lo = a.tab.cam.to_screen(reloaded.bounds().lo);
+	hi = a.tab.cam.to_screen(reloaded.bounds().hi);
 	self.move_to({ 1200, 700 });
 	self.shot("16-rotated-reloaded.png");
 	@pool()
@@ -887,8 +953,8 @@ fn void Script.test_recovery(&self)
 	{
 		b.init(bad);
 	};
-	self.check(b.path.len > 0, "the app still has somewhere to save");
-	self.check(b.path != bad, "and it is not the damaged file");
+	self.check(b.tab.path.len > 0, "the app still has somewhere to save");
+	self.check(b.tab.path != bad, "and it is not the damaged file");
 	b.shutdown();
 	self.check((String)file::load_temp(bad)!! == "TABLA\x1a\r\ncut short", "the damaged file is untouched");
 	free(b);
@@ -918,7 +984,7 @@ fn void Script.test_ui(&self)
 {
 	self.section("toolbars, with real clicks");
 	App* a = self.a;
-	Board* b = &a.board;
+	Board* b = &a.tab.board;
 	a.reset_view();
 	a.selection.clear();
 	a.tool = SELECT;
@@ -1023,10 +1089,10 @@ fn void Script.test_ui(&self)
 	float zoom_label = top.x + 6 + ui::BUTTON * 2 + 6 + ui::BUTTON + 27;
 	self.click({ zoom_label + 27 + ui::BUTTON * 0.5f, top.y + 25 });
 	self.settle_camera();
-	self.near(a.cam.zoom, 1.4, "plus zooms in");
+	self.near(a.tab.cam.zoom, 1.4, "plus zooms in");
 	self.click({ zoom_label, top.y + 25 });
 	self.settle_camera();
-	self.near(a.cam.zoom, 1.0, "the percentage goes back to 100%");
+	self.near(a.tab.cam.zoom, 1.0, "the percentage goes back to 100%");
 
 	// Paper menu.
 	float paper_x = top.x + 6 + ui::BUTTON * 2 + 6 + ui::BUTTON + 54 + ui::BUTTON * 2 + 6;
@@ -1034,15 +1100,15 @@ fn void Script.test_ui(&self)
 	self.check(a.ui.paper_open, "the paper button opens its menu");
 	RLRectangle menu = a.ui.paper_menu;
 	self.click({ menu.x + 28 + 34 * 2, menu.y + 46 });
-	self.check(a.paper == 2, "a paper swatch changes the paper");
+	self.check(a.tab.paper == 2, "a paper swatch changes the paper");
 	self.click({ menu.x + 12 + 60 + 28, menu.y + 86 });
-	self.check(a.pattern == 1, "a pattern button changes the pattern");
+	self.check(a.tab.pattern == 1, "a pattern button changes the pattern");
 	self.move_to({ menu.x + 100, menu.y + 90 });
 	self.shot("18-dark-paper.png");
 	self.click({ paper_x + ui::BUTTON * 0.5f, top.y + 25 });
 	self.check(!a.ui.paper_open, "and it closes again");
-	a.paper = 0;
-	a.pattern = 0;
+	a.tab.paper = 0;
+	a.tab.pattern = 0;
 
 	// Help.
 	Input* in = &a.input;
@@ -1085,6 +1151,564 @@ fn void Script.test_dialogs(&self)
 	self.step();
 	self.check(!dialog::is_open(), "the dialog finishes without blocking the app");
 	self.check(self.count(IMAGE) == pictures + 1, "the chosen picture is added");
+}
+
+fn void Script.test_tabs(&self)
+{
+	self.section("tabs");
+	App* a = self.a;
+	Tab* first = a.tab;
+	sz first_items = first.board.items.len();
+	PenStyle saved_pen = a.styles[Tool.PEN.ordinal];
+	PenStyle* pen = &a.styles[Tool.PEN.ordinal];
+	pen.size = 44;
+	pen.opacity = 1;
+	a.tool = PEN;
+
+	String left_path = self.fresh("tab-left.tabla");
+	a.new_board(left_path);
+	Tab* left = a.tab;
+	self.check(a.tab_count == 2 && left != first, "a new board opens in its own tab");
+	self.check(left.board.items.is_empty(), "and starts empty");
+	self.check(file::exists(left_path), "and exists on disk straight away");
+	self.check(first.board.items.len() == first_items, "the first board stays loaded");
+	a.new_board(self.fresh("tab-right.tabla"));
+	Tab* right = a.tab;
+	self.step();
+
+	pen.color = { 30, 60, 230, 255 };
+	self.scribble((Vec2[]){ { 500, 300 }, { 700, 300 } });
+	self.click(self.tab_at(1));
+	self.check(a.tab == left, "clicking a tab shows its board");
+	self.check(self.count(INK) == 0, "the click does not draw on the board");
+	pen.color = { 230, 40, 30, 255 };
+	self.scribble((Vec2[]){ { 500, 300 }, { 700, 300 } });
+	self.move_to({ 1000, 600 });
+	self.shot("30-tab-left.png");
+	@pool()
+	{
+		RLColor c = pixel(self.file("30-tab-left.png"), 600, 300);
+		self.check(c.r > 180 && c.b < 90, "the shown tab draws its own ink");
+	};
+	self.ctrl_key(TAB);
+	self.check(a.tab == right, "Ctrl+Tab goes to the next tab");
+	self.shot("31-tab-right.png");
+	@pool()
+	{
+		RLColor c = pixel(self.file("31-tab-right.png"), 600, 300);
+		self.check(c.b > 180 && c.r < 90, "and nothing of the other board shows");
+	};
+	self.ctrl_key(TAB);
+	self.check(a.tab == first, "the last tab wraps round to the first");
+	self.ctrl_key(TAB, shift: true);
+	self.check(a.tab == right, "Ctrl+Shift+Tab goes back");
+	self.ctrl_key(PAGE_UP);
+	self.check(a.tab == left, "Ctrl+PageUp goes back");
+	self.ctrl_key(PAGE_DOWN);
+	self.check(a.tab == right, "Ctrl+PageDown goes on");
+	a.input.ctrl = true;
+	self.tap(TAB); // only the repeat of a press, as an input method can send
+	a.input.ctrl = false;
+	self.check(a.tab == right, "a repeated key press does not change tabs");
+
+	// Each tab keeps its own view and history.
+	a.zoom_at({ 600, 300 }, 2);
+	self.settle_camera();
+	self.ctrl_key(PAGE_UP);
+	self.near(a.tab.cam.zoom, 1, "a view does not leak into another tab");
+	a.undo();
+	self.check(self.count(INK) == 0, "undo works on the shown board");
+	self.check(right.board.items.len() == 1, "and leaves the other board alone");
+	a.redo();
+	self.ctrl_key(PAGE_DOWN);
+	self.near(a.tab.cam.zoom, 2, "a tab comes back as it was left");
+	a.reset_view();
+
+	// Nothing that is under way gets lost or lands on the wrong board.
+	self.move_to({ 400, 420 });
+	self.press();
+	self.move_to({ 450, 440 });
+	self.ctrl_key(TAB);
+	self.check(a.tab == right, "tabs do not change in the middle of a stroke");
+	self.release();
+	self.check(self.count(INK) == 2, "and the stroke ends where it began");
+	a.tool = TEXT;
+	self.click({ 300, 520 });
+	self.type("kept");
+	self.check(a.edit_id != 0, "typing is under way");
+	self.ctrl_key(PAGE_UP);
+	self.check(a.edit_id == 0 && a.tab == left, "switching tabs finishes the text");
+	self.check(right.board.items.len() == 3, "and the text stays on its own board");
+	self.check(left.board.pending.is_empty() && right.board.pending.is_empty(), "no change is left half made");
+	a.tool = PEN;
+
+	// A tab that is out of sight still gets saved.
+	self.scribble((Vec2[]){ { 500, 500 }, { 700, 500 } });
+	self.check(left.has_unsaved(), "new ink waits for autosave");
+	self.ctrl_key(PAGE_DOWN);
+	self.check(left.has_unsaved(), "leaving the tab does not delay the switch with a save");
+	for (int i = 0; i < 90; i++) self.step();
+	self.check(!left.has_unsaved(), "a hidden tab autosaves");
+	self.check(self.saved_items(left.path) == 2, "and its file has the ink");
+
+	// Five is the limit.
+	a.new_board(self.fresh("tab-c.tabla"));
+	Tab* third = a.tab;
+	a.new_board(self.fresh("tab-d.tabla"));
+	self.step();
+	self.check(a.tab_count == app::MAX_TABS, "five tabs can be open");
+	String extra = self.fresh("tab-extra.tabla");
+	a.new_board(extra);
+	self.check(a.tab_count == app::MAX_TABS && !file::exists(extra), "a sixth new board is refused");
+	self.check(a.toast_text.contains("Close one first"), "and the app says why");
+	file::save(extra, "")!!;
+	self.check(!a.open(extra), "a sixth open board is refused");
+	a.request_dialog(NEW_BOARD);
+	self.check(!dialog::is_open(), "no dialog opens for a board that would not fit");
+	self.move_to(self.tab_at(4));
+	self.shot("32-five-tabs.png");
+
+	// A file has only one tab, however its path is spelled.
+	self.check(a.open(left_path) && a.tab == left, "opening an open board shows its tab");
+	a.show_tab(right);
+	String dotted = string::format(mem, "%s/./tab-left.tabla", self.dir);
+	self.check(a.open(dotted) && a.tab == left, "another spelling of the path finds it too");
+	a.show_tab(right);
+	String link = self.fresh("tab-link.tabla");
+	@pool()
+	{
+		self.check(c_symlink(left_path.zstr_tcopy(), link.zstr_tcopy()) == 0, "making a symbolic link");
+	};
+	self.check(a.open(link) && a.tab == left, "and so does a symbolic link");
+	self.check(a.tab_count == app::MAX_TABS, "none of that made a new tab");
+
+	// Saving over a board that is open would lose it.
+	a.show_tab(right);
+	a.new_board(left_path);
+	self.check(a.tab == left && left.board.items.len() == 2, "a new board cannot replace an open one");
+	self.check(self.saved_items(left_path) == 2, "and that board's file is kept");
+	a.save_as(right.path);
+	self.check(a.tab.path == left_path, "save as cannot take over another tab's file");
+	self.check(self.saved_items(right.path) == 3, "and the other tab's file is kept");
+
+	// Closing.
+	Tab* last = a.tabs[4];
+	a.show_tab(last);
+	self.letter('w', ctrl: true);
+	self.check(a.tab_count == 4 && a.tab == a.tabs[3], "Ctrl+W closes the tab and shows its neighbour");
+	Input* in = &a.input;
+	in.ctrl = true;
+	in.letters['w' - 'a'] = true;
+	self.step();
+	in.ctrl = false;
+	self.check(a.tab_count == 4, "a held Ctrl+W closes only one tab");
+	a.show_tab(left);
+	self.step();
+	self.move_to(self.tab_cross(a.tab_index(third)));
+	self.click(self.tab_cross(a.tab_index(third)));
+	self.check(a.tab_count == 3 && a.tab == left, "the cross closes a hidden tab and stays put");
+	self.click(self.tab_cross(a.tab_index(left)));
+	self.check(a.tab_count == 2 && a.tab == right, "the cross on the shown tab shows the next");
+	self.check(self.saved_items(left_path) == 2, "a closed board is on disk");
+	self.check(a.close_tab(right) && a.tab == first, "the first board is back");
+	self.check(first.board.items.len() == first_items, "with everything it had");
+	self.check(!a.close_tab(first), "the last tab stays open");
+	a.toast_text = "";
+	self.step();
+	self.click(self.tab_cross(0));
+	self.check(a.tab_count == 1 && !a.toast_text.len, "and has no cross to click");
+	a.styles[Tool.PEN.ordinal] = saved_pen;
+}
+
+fn void Script.test_copy_between_tabs(&self)
+{
+	self.section("copying between tabs");
+	App* a = self.a;
+	Tab* first = a.tab;
+	String picture = self.file("tab-photo.png");
+	@pool()
+	{
+		make_test_picture(picture.zstr_tcopy(), { 220, 40, 40, 255 });
+	};
+	a.new_board(self.fresh("tab-target.tabla"));
+	Tab* target = a.tab;
+	a.new_board(self.fresh("tab-source.tabla"));
+	Tab* source = a.tab;
+	self.step();
+	String[1] files = { picture };
+	a.add_files(&files, { 640, 400 });
+	self.step();
+	Item* photo = self.top();
+	self.check(photo.kind == IMAGE, "the picture is on the source board");
+	a.tool = PEN;
+	self.scribble((Vec2[]){ { 620, 400 }, { 660, 400 } });
+	self.check(self.top().parent == photo.id, "with ink pinned to it");
+	a.tool = SELECT;
+	a.selection.clear();
+	a.selection.push(photo.id);
+	a.copy();
+	self.check(a.close_tab(source), "the source tab can close after copying");
+	self.check(a.tab == target, "leaving the other tab on screen");
+	self.step();
+
+	a.place_copies(&a.clip_items, { 640, 400 });
+	self.check(self.count(IMAGE) == 1 && self.count(INK) == 1, "the paste arrives on another board");
+	self.check(target.board.assets.len() == 1, "and that board has the picture itself");
+	Item* pasted = a.tab.board.get(a.selection[0])!!;
+	foreach (item : a.tab.board.items)
+	{
+		if (item.kind == INK) self.check(item.parent == pasted.id, "pinned ink follows it");
+	}
+	a.tool = PEN;
+	self.step();
+	self.step();
+	self.check(pasted.asset.state == READY, "and the picture loads");
+	self.move_to({ 1000, 700 });
+	self.shot("33-pasted-between-tabs.png");
+	@pool()
+	{
+		Vec2 sky = a.tab.cam.to_screen(pasted.pos + (DVec2){ 40.0, 20.0 } * pasted.scale);
+		RLColor c = pixel(self.file("33-pasted-between-tabs.png"), (int)sky.x, (int)sky.y);
+		self.check(c.r > 170 && c.b < 110, "with its real colours");
+	};
+	a.place_copies(&a.clip_items, { 300, 300 });
+	self.check(target.board.assets.len() == 1, "pasting twice stores the picture once");
+	self.check(a.save_now(true), "saving the pasted picture");
+	Board check;
+	check.init();
+	(void)store::load(&check, target.path);
+	self.check(check.assets.len() == 1 && check.assets[0].bytes.len > 0, "the picture is in the file");
+	check.free();
+	a.tool = PEN;
+	self.check(a.close_tab(target) && a.tab == first, "back to the first board");
+	a.clear_clip();
+}
+
+fn void Script.test_dialogs_and_tabs(&self)
+{
+	self.section("dialogs and tabs");
+	App* a = self.a;
+	if (!env::tget_var("E2E_FAKE_ZENITY") ?? false)
+	{
+		io::printn("  skipped: scripts/e2e.sh provides a stand-in for zenity");
+		return;
+	}
+	Tab* first = a.tab;
+	a.new_board(self.fresh("tab-asking.tabla"));
+	Tab* asking = a.tab;
+	a.new_board(self.fresh("tab-other.tabla"));
+	Tab* other = a.tab;
+
+	a.show_tab(asking);
+	a.request_dialog(ADD_IMAGES);
+	a.show_tab(other); // a board dropped on the window can do this while the dialog is up
+	self.wait_for_dialog();
+	self.check(asking.board.assets.len() == 1, "a dialog's answer goes to the tab that asked");
+	self.check(other.board.assets.is_empty(), "not to the tab that happens to be on screen");
+	self.check(a.tab == asking, "and that tab is shown");
+
+	a.show_tab(other);
+	self.step();
+	a.request_dialog(ADD_IMAGES);
+	self.check(a.close_tab(other), "closing the tab that asked");
+	self.wait_for_dialog();
+	self.check(a.toast_text.contains("closed"), "an answer for a closed tab is reported");
+	self.check(asking.board.assets.len() == 1, "and goes nowhere else");
+
+	// An answer that arrives during a stroke waits for the stroke to end.
+	int pictures = self.count(IMAGE);
+	a.tool = PEN;
+	self.move_to({ 500, 300 });
+	self.press();
+	self.move_to({ 560, 320 });
+	a.request_dialog(ADD_IMAGES);
+	for (int i = 0; i < 400 && dialog::is_open(); i++)
+	{
+		self.step();
+		rl::wait_time(0.005);
+	}
+	self.step();
+	self.check(a.mode == INKING && self.count(IMAGE) == pictures, "a dialog's answer waits for the pointer");
+	self.release();
+	self.step();
+	self.check(self.count(INK) == 1, "the stroke is finished");
+	self.check(self.count(IMAGE) == pictures + 1, "and then the answer is applied");
+	self.check(a.close_tab(asking) && a.tab == first, "back to the first board");
+}
+
+fn void Script.test_failed_saves(&self)
+{
+	self.section("boards that cannot be saved");
+	App* a = self.a;
+	Tab* first = a.tab;
+	a.tool = PEN;
+	// A regular file in the middle of a path makes every save there fail, even for root.
+	String wall = self.file("tab-wall");
+	file::save(wall, "not a directory")!!;
+	String blocked = string::format(mem, "%s/inside.tabla", wall);
+
+	sz tabs = a.tab_count;
+	a.new_board(blocked);
+	self.check(a.tab_count == tabs, "a new board that cannot be written does not open");
+	self.check(a.toast_text.contains("Could not create"), "and the app says so");
+
+	String good = self.fresh("tab-failing.tabla");
+	a.new_board(good);
+	Tab* failing = a.tab;
+	self.step();
+	self.scribble((Vec2[]){ { 500, 300 }, { 700, 300 } });
+
+	// The file's folder disappears, as a removable disk's would.
+	free(failing.path);
+	failing.path = blocked.copy(mem);
+	self.check(!a.close_tab(failing), "a tab that cannot save refuses to close");
+	self.check(a.tab == failing && self.count(INK) == 1, "and its board is intact");
+	self.check(failing.save_failed, "the tab shows that it failed");
+	self.check(a.toast_text.contains("stays open"), "and the app says what happened");
+	self.letter('w', ctrl: true);
+	self.check(a.tab_count == tabs + 1, "Ctrl+W is held back in the same way");
+	self.move_to({ 1000, 600 });
+	self.shot("34-failed-save.png");
+
+	// Opening another board used to close this one regardless.
+	String next = self.fresh("tab-next.tabla");
+	a.new_board(next);
+	self.check(a.tab_count == tabs + 2, "opening another board keeps it");
+	self.check(failing.board.items.len() == 1, "with its work");
+
+	a.input.time += 1;
+	a.quit_confirm_until = 0;
+	a.request_quit();
+	self.check(!a.quit, "quitting is held back while a board cannot be saved");
+	self.check(a.toast_text.contains("again"), "and the app says how to go on");
+	a.input.time += app::QUIT_CONFIRM_SECONDS + 1;
+	a.request_quit();
+	self.check(!a.quit, "a much later close is a first close again");
+	a.request_quit();
+	self.check(a.quit, "a second close is the user's decision");
+	a.quit = false;
+
+	// Hidden or not, it keeps trying, and recovers as soon as the file is back.
+	free(failing.path);
+	failing.path = good.copy(mem);
+	self.check(failing.has_unsaved(), "the board is still waiting to be saved");
+	self.step();
+	a.input.time += app::AUTOSAVE_RETRY + 1;
+	self.step();
+	self.check(!failing.has_unsaved() && !failing.save_failed, "a hidden tab retries and recovers");
+	self.check(self.saved_items(good) == 1, "and the work reaches the file");
+	self.check(a.close_tab(a.tab), "closing the other tab");
+
+	// Save as must not abandon a file that works for one that does not.
+	a.show_tab(failing);
+	self.scribble((Vec2[]){ { 500, 400 }, { 700, 400 } });
+	a.save_as(blocked);
+	self.check(a.tab == failing && failing.path == good, "a failed save as keeps the old file");
+	self.check(a.toast_text.contains("Could not save"), "and says so");
+	for (int i = 0; i < 90; i++) self.step();
+	self.check(self.saved_items(good) == 2, "and autosave carries on there");
+	String moved = self.fresh("tab-moved.tabla");
+	a.save_as(moved);
+	self.check(failing.path == moved && self.saved_items(moved) == 2, "a working save as moves the board");
+	self.check(a.close_tab(failing) && a.tab == first, "back to the first board");
+	a.quit_confirm_until = 0;
+}
+
+fn long Script.texture_bytes(&self)
+{
+	long used = 0;
+	foreach (tab : self.a.open_tabs())
+	{
+		foreach (asset : tab.board.assets)
+		{
+			if (asset.state == READY) used += asset.texture_bytes;
+		}
+	}
+	return used;
+}
+
+fn int count_ready(Tab* tab) @local
+{
+	int ready = 0;
+	foreach (asset : tab.board.assets)
+	{
+		if (asset.state == READY) ready++;
+	}
+	return ready;
+}
+
+fn void Script.test_photo_limit(&self)
+{
+	self.section("photo memory limit");
+	App* a = self.a;
+	Tab* first = a.tab;
+	a.tool = SELECT;
+	long one = (long)640 * 420 * 4 * 4 / 3;
+	RLColor[*] skies = { { 220, 40, 40, 255 }, { 40, 200, 60, 255 }, { 40, 60, 220, 255 }, { 220, 200, 40, 255 }, { 40, 200, 220, 255 } };
+	String[5] files;
+	foreach (i, sky : skies)
+	{
+		files[i] = self.file(string::tformat("limit-%d.png", i));
+		@pool()
+		{
+			make_test_picture(files[i].zstr_tcopy(), sky);
+		};
+	}
+	a.show_tab(first);
+	foreach (asset : first.board.assets)
+	{
+		if (asset.state == READY) render::drop_texture(asset);
+	}
+	a.tab.cam = { .origin = { 1e7, 1e7 }, .zoom = 1 }; // the first board's pictures are out of view
+	a.tab.cam_target = a.tab.cam;
+	self.step();
+	a.gfx.texture_budget = one * 2 + 1000;
+
+	a.new_board(self.fresh("limit-gallery.tabla"));
+	Tab* gallery = a.tab;
+	self.step();
+	Vec2[3] spots = { { 330, 240 }, { 900, 240 }, { 620, 590 } };
+	foreach (i, spot : spots)
+	{
+		String[1] file_name = { files[i] };
+		a.add_files(&file_name, spot);
+	}
+	a.selection.clear();
+	foreach (item : a.tab.board.items) a.tab.board.touch(item).scale = 0.6;
+	a.tab.board.commit();
+	a.fit_all();
+	self.settle_camera();
+	for (int i = 0; i < 5; i++) self.step();
+	self.check(gallery.board.assets.len() == 3, "three pictures on one board");
+	self.check(count_ready(gallery) == 3, "pictures on screen stay, even over the limit");
+
+	a.new_board(self.fresh("limit-other.tabla"));
+	Tab* other = a.tab;
+	self.step();
+	foreach (i, spot : (Vec2[]){ { 330, 400 }, { 900, 400 } })
+	{
+		String[1] file_name = { files[3 + i] };
+		a.add_files(&file_name, spot);
+	}
+	a.selection.clear();
+	self.step();
+	self.step();
+	self.check(count_ready(other) == 2, "the tab on screen has its pictures");
+	self.check(count_ready(gallery) == 0, "the hidden tab has given up its textures");
+	self.check(self.texture_bytes() <= a.gfx.texture_budget, "and memory is back within the limit");
+
+	// Going back loads them again, and the app must not go idle half way through: with
+	// no input coming, the remaining pictures would stay grey until the mouse moved.
+	for (int i = 0; i < 300; i++) self.step();
+	self.check(!a.busy(), "nothing else is keeping the app awake");
+	a.show_tab(gallery);
+	self.step();
+	self.check(count_ready(gallery) == 1, "pictures come back one per frame");
+	self.check(a.busy(), "the app keeps working while pictures are missing");
+	self.step();
+	self.check(a.busy(), "and still does with one to go");
+	self.step();
+	self.check(count_ready(gallery) == 3, "all of them return");
+	self.check(!a.busy(), "and then the app can rest");
+	self.check(count_ready(other) == 0, "at the cost of the tab now hidden");
+	self.move_to({ 1250, 780 });
+	self.shot("35-photos-after-limit.png");
+	@pool()
+	{
+		foreach (i, item : gallery.board.items)
+		{
+			Vec2 p = a.tab.cam.to_screen(item.pos + (DVec2){ 30.0, 12.0 } * item.scale);
+			RLColor c = pixel(self.file("35-photos-after-limit.png"), (int)p.x, (int)p.y);
+			RLColor want = skies[i];
+			bool close = math::abs((int)c.r - want.r) < 70 && math::abs((int)c.g - want.g) < 70 && math::abs((int)c.b - want.b) < 70;
+			self.check(close, "a reloaded picture shows its own pixels");
+		}
+	};
+
+	// Within a tab too: the one drawn longest ago goes first.
+	a.tab.cam = { .origin = { 1e7, 1e7 }, .zoom = 1 };
+	a.tab.cam_target = a.tab.cam;
+	foreach (asset : gallery.board.assets)
+	{
+		if (asset.state == READY) render::drop_texture(asset);
+	}
+	Item*[3] pictures = { gallery.board.items[0], gallery.board.items[1], gallery.board.items[2] };
+	foreach (item : pictures)
+	{
+		a.fit_view(item.bounds());
+		a.tab.cam = a.tab.cam_target;
+		self.step();
+		self.step();
+		self.check(item.asset.state == READY, "the picture in view is loaded");
+	}
+	self.check(pictures[0].asset.state == UNLOADED, "the least recently seen picture goes first");
+	self.check(pictures[1].asset.state == READY, "and the more recent one stays");
+
+	// Dropped textures cost nothing that matters: the bytes are still there.
+	Asset* dropped = pictures[0].asset;
+	self.check(dropped.bytes.len > 0, "the picture's file stays in memory");
+	self.check(a.save_now(true), "a board with dropped textures saves");
+	Board check;
+	check.init();
+	(void)store::load(&check, gallery.path);
+	self.check(check.assets.len() == 3, "with every picture in it");
+	check.free();
+	a.selection.clear();
+	a.tab.board.bring_to_front(pictures[0]);
+	a.tab.board.commit();
+	a.undo();
+	self.check(gallery.board.items.len() == 3, "undo does not need the texture");
+
+	// Export wants every picture at once, and is allowed to, but only for a moment.
+	String png = self.fresh("limit-export.png");
+	a.export_board(png);
+	self.check(file::exists(png), "a board over the limit exports");
+	self.step();
+	self.check(self.texture_bytes() <= a.gfx.texture_budget, "and memory comes back down afterwards");
+	@pool()
+	{
+		RLImage image = rl::load_image(png.zstr_tcopy());
+		self.check(image.width > 100, "the export has content");
+		rl::unload_image(image);
+	};
+
+	a.gfx.texture_budget = render::TEXTURE_BUDGET;
+	self.check(a.close_tab(other), "closing the test tabs");
+	self.check(a.close_tab(gallery) && a.tab == first, "back to the first board");
+}
+
+fn void Script.test_tab_names(&self)
+{
+	self.section("tab names in a narrow window");
+	App* a = self.a;
+	Tab* first = a.tab;
+	int width = rl::get_screen_width();
+	int height = rl::get_screen_height();
+	rl::set_window_size(860, 670);
+	for (int i = 0; i < 30 && rl::get_screen_width() != 860; i++)
+	{
+		self.step();
+		rl::wait_time(0.02);
+	}
+	self.check(rl::get_screen_width() == 860, "the window can get this small");
+	String[4] names = { "šđčćž-plan-za-veliku-tablu.tabla", "short.tabla", "ideas-and-other-long-names-that-go-on.tabla", "čć.tabla" };
+	foreach (name : names) a.new_board(self.fresh(name));
+	self.check(a.tab_count == app::MAX_TABS, "five tabs");
+	self.move_to({ 500, 400 });
+	self.step();
+	self.shot("36-narrow-tabs.png");
+	self.check(a.ui.tab_strip.x + a.ui.tab_strip.width <= a.ui.top.x, "the tabs stop short of the toolbar");
+	self.check(a.ui.rail.y >= a.ui.tab_strip.y + a.ui.tab_strip.height, "and clear of the tool rail");
+	self.check(a.ui.rail.y + a.ui.rail.height <= rl::get_screen_height(), "and the rail still fits");
+	foreach (tab : a.open_tabs()) tab.board.commit();
+	while (a.tab_count > 1) self.check(a.close_tab(a.tab), "closing a test tab");
+	self.check(a.tab == first, "back to the first board");
+	rl::set_window_size(width, height);
+	for (int i = 0; i < 30 && rl::get_screen_width() != width; i++)
+	{
+		self.step();
+		rl::wait_time(0.02);
+	}
 }
 
 fn void Script.test_clipboard(&self)
@@ -1137,6 +1761,12 @@ fn int run_e2e(String dir)
 	s.test_ui();
 	s.test_dialogs();
 	s.test_clipboard();
+	s.test_tabs();
+	s.test_copy_between_tabs();
+	s.test_dialogs_and_tabs();
+	s.test_failed_saves();
+	s.test_photo_limit();
+	s.test_tab_names();
 	a.shutdown();
 	rl::close_window();
 	io::printfn("%d checks, %d failed", s.checks, s.failures);
@@ -1162,7 +1792,7 @@ fn int run_perf(String dir, int strokes)
 	a.init(path);
 	a.input.time = 100;
 	Script s = { .a = a, .dir = dir };
-	Board* b = &a.board;
+	Board* b = &a.tab.board;
 
 	const int POINTS = 80;
 	double t = rl::get_time();
@@ -1181,14 +1811,14 @@ fn int run_perf(String dir, int strokes)
 	io::printfn("build board           %8.1f ms", (rl::get_time() - t) * 1000);
 
 	a.fit_all();
-	a.cam = a.cam_target;
+	a.tab.cam = a.tab.cam_target;
 	t = rl::get_time();
 	s.step();
 	io::printfn("first frame (meshes)  %8.1f ms", (rl::get_time() - t) * 1000);
 	io::printfn("frame, all visible    %8.2f ms", s.time_frames(60));
 
-	a.cam = { .origin = { 0, 0 }, .zoom = 1 };
-	a.cam_target = a.cam;
+	a.tab.cam = { .origin = { 0, 0 }, .zoom = 1 };
+	a.tab.cam_target = a.tab.cam;
 	s.step();
 	io::printfn("frame, zoomed in      %8.2f ms", s.time_frames(60));
 	a.tool = SELECT;
@@ -1230,7 +1860,7 @@ fn int run_perf(String dir, int strokes)
 	a.selection.clear();
 
 	// Screen (100, 100) is left of everything, so this drag starts on empty canvas.
-	a.cam = a.cam_target = { .origin = { -3000, -3000 }, .zoom = 0.05 };
+	a.tab.cam = a.tab.cam_target = { .origin = { -3000, -3000 }, .zoom = 0.05 };
 	s.step();
 	t = rl::get_time();
 	s.drag({ 100, 100 }, { 1200, 780 }, 4);
@@ -1241,8 +1871,23 @@ fn int run_perf(String dir, int strokes)
 	a.save_now(true);
 	io::printfn("save                  %8.1f ms, %d KB", (rl::get_time() - t) * 1000, (file::get_size(path) ?? 0) / 1024);
 	t = rl::get_time();
-	a.open(path);
+	Board loaded;
+	loaded.init();
+	(void)store::load(&loaded, path);
 	io::printfn("load                  %8.1f ms", (rl::get_time() - t) * 1000);
+	loaded.free();
+
+	// The other tabs stay loaded, so going back to this board is one ordinary frame.
+	String other = string::format(mem, "%s/perf-tab.tabla", dir);
+	(void)file::delete(other);
+	a.new_board(other);
+	t = rl::get_time();
+	for (int i = 0; i < 20; i++)
+	{
+		a.cycle_tab(1);
+		s.step();
+	}
+	io::printfn("switch tab and draw   %8.2f ms", (rl::get_time() - t) * 1000 / 20);
 	a.shutdown();
 	rl::close_window();
 	return 0;

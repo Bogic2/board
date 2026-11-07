@@ -11,6 +11,7 @@ Needs `c3c` 0.8.5 or newer and the X11 development library (`libx11-dev`).
 c3c build tabla                  # optimised binary in build/tabla
 build/tabla                      # your default board
 build/tabla ideas.tabla          # a specific board, created if it does not exist
+build/tabla ideas.tabla plans.tabla   # several boards, each in its own tab
 ```
 
 The default board is `~/.local/share/tabla/board.tabla`. `zenity` provides the file
@@ -34,9 +35,15 @@ dialogs; without it, you can still drop files on the window.
 - **Text and sticky notes**, with Latin, accented and Cyrillic characters.
 - **Select, move, resize, duplicate, layer order, recolour.**
 - **Undo and redo** for everything, 512 steps back.
-- **Saving is automatic.** Changes are written a second after you stop, and always when
-  you quit. A save replaces the file atomically, so a crash cannot damage your board.
-  Pictures are stored inside the board file.
+- **Tabs.** Up to five boards open at once, each with its own view and undo history.
+  Ctrl+N and Ctrl+O open a board in a new tab, Ctrl+Tab moves between them and Ctrl+W
+  closes one. Copy and paste works between tabs, pictures included.
+- **Saving is automatic.** Changes are written a second after you stop, in every tab, and
+  always when you quit. A save replaces the file atomically, so a crash cannot damage your
+  board. Pictures are stored inside the board file.
+- **Failed saves do not lose work.** A board that cannot be saved keeps a red dot on its
+  tab, stays open when you try to close it, and keeps trying. Quitting then takes a second
+  close of the window.
 - **PNG export** of the whole board, or of the selection if there is one.
 
 Press **F1** in the app for all shortcuts.
@@ -77,7 +84,10 @@ clipboard.
 - Pictures cannot be rotated or cropped yet, and WebP cannot be read.
 - Pictures wider or taller than 4096 pixels are downscaled for display. The original is
   kept in the board file.
-- Copied items can be pasted within a board, but not into another board.
+- Open pictures may use up to 2 GB of graphics memory. Past that, the ones seen longest
+  ago are let go and load again when next on screen, one per frame, which is slower for
+  large photos. Pictures on screen always stay, even over the limit.
+- Tabs are not remembered between runs.
 
 ## Credits
 

@@ -16,6 +16,7 @@ const Rgba ACCENT_SOFT = { 59, 110, 246, 34 };
 const Rgba HOVER = { 20, 24, 32, 18 };
 const Rgba WHITE = { 255, 255, 255, 255 };
 const Rgba DARK = { 28, 31, 38, 240 };
+const Rgba DANGER = { 214, 48, 49, 255 };
 
 const Rgba[12] INK_COLORS = {
 	{ 26, 26, 30, 255 },
@@ -125,7 +126,8 @@ const HelpLine[*] HELP_RIGHT = {
 	{ "Ctrl+C  X  V  D", "Copy, cut, paste, duplicate" },
 	{ "Ctrl+A, Delete", "Select all, delete" },
 	{ "Ctrl+S, Ctrl+Shift+S", "Save, save as" },
-	{ "Ctrl+O, Ctrl+N", "Open, new board" },
+	{ "Ctrl+O, Ctrl+N", "Open, new board, each in a tab" },
+	{ "Ctrl+Tab, Ctrl+W", "Next tab, close tab" },
 	{ "Ctrl+E", "Export PNG" },
 };
 
@@ -139,13 +141,17 @@ const float BUTTON = 36;
 const float SLIDER_WIDTH = 92;
 const float SLIDER_BLOCK = 128;
 const float SWATCH = 26;
+const float TAB_WIDTH = 176;
 
 struct Ui
 {
 	RLRectangle rail;
 	RLRectangle top;
 	RLRectangle bar;
-	RLRectangle title;
+	RLRectangle tab_strip;
+	float tab_width;
+	Tab* tab_to_show;
+	Tab* tab_to_close;
 	RLRectangle picker;
 	RLRectangle paper_menu;
 	RLRectangle help;
@@ -204,15 +210,20 @@ fn void Ui.layout(&self, App* a, Input* in)
 	float w = in.width;
 	float h = in.height;
 	float rail_h = rail_height();
-	self.rail = { .x = 12, .y = math::max(12.0f, (h - rail_h) * 0.5f), .width = BUTTON + 10, .height = rail_h };
+	float top_h = BUTTON + 10;
+	self.rail = { .x = 12, .y = math::max(12 + top_h + 8, (h - rail_h) * 0.5f), .width = BUTTON + 10, .height = rail_h };
 	float top_w = BUTTON * 10 + 54 + 24;
-	self.top = { .x = w - top_w - 12, .y = 12, .width = top_w, .height = BUTTON + 10 };
+	self.top = { .x = w - top_w - 12, .y = 12, .width = top_w, .height = top_h };
+	float plus = a.tab_count < app::MAX_TABS ? BUTTON : 0;
+	float strip_w = math::min(TAB_WIDTH * a.tab_count + plus + 12, self.top.x - 8 - 12);
+	self.tab_strip = { .x = 12, .y = 12, .width = strip_w, .height = top_h };
+	self.tab_width = (strip_w - plus - 12) / a.tab_count;
 	float bar_w = bar_width(a);
 	self.bar_visible = bar_w > 0;
 	self.bar = { .x = (w - bar_w) * 0.5f, .y = h - 64, .width = bar_w, .height = 52 };
 	self.picker = { .x = self.bar.x + 24, .y = self.bar.y - 196, .width = 212, .height = 188 };
 	self.paper_menu = { .x = w - 12 - 200, .y = self.top.y + self.top.height + 8, .width = 200, .height = 112 };
-	self.help = { .x = (w - 860) * 0.5f, .y = (h - 372) * 0.5f, .width = 860, .height = 372 };
+	self.help = { .x = (w - 860) * 0.5f, .y = (h - 400) * 0.5f, .width = 860, .height = 400 };
 	if (!self.bar_visible) self.picker_open = false;
 }
 
@@ -225,7 +236,7 @@ fn bool Ui.covers(&self, App* a, Input* in)
 	if (a.help_open || self.active) return true;
 	if (a.mode != IDLE) return false;
 	Vec2 m = in.mouse;
-	if (inside(self.rail, m) || inside(self.top, m) || inside(self.title, m)) return true;
+	if (inside(self.rail, m) || inside(self.top, m) || inside(self.tab_strip, m)) return true;
 	if (self.bar_visible && inside(self.bar, m)) return true;
 	if (self.picker_open && inside(self.picker, m)) return true;
 	if (self.paper_open && inside(self.paper_menu, m)) return true;
@@ -260,6 +271,21 @@ fn float text_width(RLFont font, String text) @local
 	{
 		return rl::measure_text_ex(font, text.zstr_tcopy(), font.base_size, 0).x;
 	};
+}
+
+// Shortens `text` to fit `width`, cutting between characters.
+fn String fit_text(RLFont font, String text, float width) @local
+{
+	if (text_width(font, text) <= width) return text;
+	sz length = text.len;
+	while (length > 0)
+	{
+		length--;
+		while (length > 0 && (text[length] & 0xC0) == 0x80) length--;
+		String shorter = text[:length].tconcat("...");
+		if (text_width(font, shorter) <= width) return shorter;
+	}
+	return "...";
 }
 
 fn void stroke(Vec2 c, float x0, float y0, float x1, float y1, Rgba color, float width = 1.8f) @local
@@ -709,8 +735,8 @@ fn void Ui.draw_top(&self, App* a, Input* in)
 {
 	panel(self.top);
 	RLRectangle r = { .x = self.top.x + 6, .y = self.top.y + 5, .width = BUTTON, .height = BUTTON };
-	bool can_undo = a.board.undo_steps.len() > 0;
-	bool can_redo = a.board.redo_steps.len() > 0;
+	bool can_undo = a.tab.board.undo_steps.len() > 0;
+	bool can_redo = a.tab.board.redo_steps.len() > 0;
 	if (self.button(in, r, UNDO, "Undo  (Ctrl+Z)", enabled: can_undo)) a.undo();
 	r.x += BUTTON;
 	if (self.button(in, r, REDO, "Redo  (Ctrl+Y)", enabled: can_redo)) a.redo();
@@ -725,11 +751,11 @@ fn void Ui.draw_top(&self, App* a, Input* in)
 		rl::draw_rectangle_rounded(zoom, 0.28f, 6, HOVER);
 		self.tip = "Back to 100%  (Ctrl+0)";
 		self.tip_at = { zoom.x + 10, zoom.y + zoom.height + 16 };
-		if (in.left_pressed) a.zoom_at(a.view_center(), 1 / a.cam_target.zoom);
+		if (in.left_pressed) a.zoom_at(a.view_center(), 1 / a.tab.cam_target.zoom);
 	}
 	@pool()
 	{
-		double percent = a.cam_target.zoom * 100;
+		double percent = a.tab.cam_target.zoom * 100;
 		String text = percent >= 10 ? string::tformat("%d%%", (long)math::round(percent)) : string::tformat("%.2g%%", percent);
 		label(a.gfx.ui_font, text, zoom.x + (zoom.width - text_width(a.gfx.ui_font, text)) * 0.5f, zoom.y + 11, INK);
 	};
@@ -761,10 +787,10 @@ fn void Ui.draw_paper_menu(&self, App* a, Input* in)
 	float x = p.x + 28;
 	foreach (i, paper : render::PAPERS)
 	{
-		if (self.swatch(in, { x, p.y + 46 }, paper.color, a.paper == (char)i))
+		if (self.swatch(in, { x, p.y + 46 }, paper.color, a.tab.paper == (char)i))
 		{
-			a.paper = (char)i;
-			a.view_dirty = true;
+			a.tab.paper = (char)i;
+			a.tab.view_dirty = true;
 		}
 		x += 34;
 	}
@@ -774,7 +800,7 @@ fn void Ui.draw_paper_menu(&self, App* a, Input* in)
 	{
 		RLRectangle r = { .x = x, .y = p.y + 72, .width = 56, .height = 28 };
 		bool hover = self.enabled && inside(r, in.mouse);
-		bool chosen = a.pattern == (char)i;
+		bool chosen = a.tab.pattern == (char)i;
 		if (chosen)
 		{
 			rl::draw_rectangle_rounded(r, 0.3f, 6, ACCENT_SOFT);
@@ -786,35 +812,76 @@ fn void Ui.draw_paper_menu(&self, App* a, Input* in)
 		label(a.gfx.ui_font, name, r.x + (r.width - text_width(a.gfx.ui_font, name)) * 0.5f, r.y + 6, chosen ? ACCENT : INK);
 		if (hover && in.left_pressed)
 		{
-			a.pattern = (char)i;
-			a.view_dirty = true;
+			a.tab.pattern = (char)i;
+			a.tab.view_dirty = true;
 		}
 		x += 60;
 	}
 }
 
-fn void Ui.draw_title(&self, App* a, Input* in)
+fn void Ui.draw_tab(&self, App* a, Input* in, Tab* tab, RLRectangle r)
 {
+	bool shown = tab == a.tab;
+	bool hover = self.enabled && inside(r, in.mouse);
+	bool closable = a.tab_count > 1 && (hover || shown);
+	if (shown)
+	{
+		rl::draw_rectangle_rounded(r, 0.28f, 6, ACCENT_SOFT);
+	}
+	else if (hover)
+	{
+		rl::draw_rectangle_rounded(r, 0.28f, 6, HOVER);
+	}
+	float mid = r.y + r.height * 0.5f;
+	if (tab.has_unsaved()) rl::draw_circle_v({ r.x + 11, mid }, 3, tab.save_failed ? DANGER : MUTED);
+	RLFont font = shown ? a.gfx.ui_bold : a.gfx.ui_font;
+	float text_x = r.x + 20;
+	float text_end = r.x + r.width - (closable ? 28 : 8);
 	@pool()
 	{
-		String name = a.path.len ? a.path.file_tbasename() ?? "board" : "Unsaved board";
-		if (name.ends_with(".tabla")) name = name[:name.len - 6];
-		String status = !a.path.len ? "not saved" : a.has_unsaved() ? "saving..." : "saved";
-		float name_w = text_width(a.gfx.ui_bold, name);
-		float status_w = text_width(a.gfx.ui_font, status);
-		self.title = { .x = 12, .y = 12, .width = name_w + status_w + 44, .height = 36 };
-		panel(self.title, 10);
-		label(a.gfx.ui_bold, name, self.title.x + 14, self.title.y + 10, INK);
-		label(a.gfx.ui_font, status, self.title.x + 30 + name_w, self.title.y + 10, MUTED);
+		label(font, fit_text(font, tab.name(), text_end - text_x), text_x, r.y + 10, shown ? INK : MUTED);
 	};
+	if (closable)
+	{
+		RLRectangle cross = { .x = r.x + r.width - 26, .y = mid - 10, .width = 20, .height = 20 };
+		bool over_cross = hover && inside(cross, in.mouse);
+		if (over_cross) rl::draw_rectangle_rounded(cross, 0.3f, 6, HOVER);
+		Vec2 c = { cross.x + 10, mid };
+		stroke(c, -4, -4, 4, 4, MUTED, 1.6f);
+		stroke(c, -4, 4, 4, -4, MUTED, 1.6f);
+		if (over_cross && in.left_pressed)
+		{
+			self.tab_to_close = tab;
+			return;
+		}
+	}
+	if (!hover) return;
+	String status = !tab.path.len ? "not saved" : tab.save_failed ? "could not save" : tab.has_unsaved() ? "saving..." : "saved";
+	self.tip = string::tformat_zstr("%s  (%s)", tab.path.len ? tab.path : tab.name(), status);
+	self.tip_at = { r.x + 6, r.y + r.height + 24 };
+	if (in.left_pressed) self.tab_to_show = tab;
+}
+
+fn void Ui.draw_tabs(&self, App* a, Input* in)
+{
+	panel(self.tab_strip);
+	RLRectangle r = { .x = self.tab_strip.x + 6, .y = self.tab_strip.y + 5, .width = self.tab_width, .height = BUTTON };
+	foreach (tab : a.open_tabs())
+	{
+		self.draw_tab(a, in, tab, r);
+		r.x += self.tab_width;
+	}
+	if (a.tab_count == app::MAX_TABS) return;
+	r.width = BUTTON;
+	if (self.button(in, r, PLUS, "New board  (Ctrl+N)")) a.request_dialog(NEW_BOARD);
 }
 
 fn void Ui.draw_selection(&self, App* a, Input* in)
 {
-	Camera* cam = &a.cam;
+	Camera* cam = &a.tab.cam;
 	if (a.hover_id && !a.is_selected(a.hover_id))
 	{
-		Item*? item = a.board.get(a.hover_id);
+		Item*? item = a.tab.board.get(a.hover_id);
 		if (try item)
 		{
 			DRect b = item.bounds();
@@ -839,7 +906,7 @@ fn void Ui.draw_selection(&self, App* a, Input* in)
 fn void Ui.draw_marquee(&self, App* a, Input* in)
 {
 	if (a.mode != MARQUEE) return;
-	Vec2 p = a.cam.to_screen(a.press_world);
+	Vec2 p = a.tab.cam.to_screen(a.press_world);
 	RLRectangle r = {
 		.x = math::min(p.x, in.mouse.x), .y = math::min(p.y, in.mouse.y),
 		.width = math::abs(in.mouse.x - p.x), .height = math::abs(in.mouse.y - p.y)
@@ -851,15 +918,15 @@ fn void Ui.draw_marquee(&self, App* a, Input* in)
 fn void Ui.draw_caret(&self, App* a, Input* in)
 {
 	if (!a.edit_id) return;
-	Item*? item = a.board.get(a.edit_id);
+	Item*? item = a.tab.board.get(a.edit_id);
 	if (catch item) return;
 	if ((in.time - a.caret_blink) % 1.0 > 0.6) return;
 	bool note = item.fill.a > 0;
 	float pad = note ? render::NOTE_PAD : 0;
 	float wrap = note ? item.size.x - render::NOTE_PAD * 2 : 0;
 	Vec2 local = a.gfx.caret_position(a.edit_string(), wrap, a.edit_caret);
-	float s = (float)(item.scale * a.cam.zoom);
-	Vec2 p = a.cam.to_screen(item.pos);
+	float s = (float)(item.scale * a.tab.cam.zoom);
+	Vec2 p = a.tab.cam.to_screen(item.pos);
 	rl::draw_rectangle_rec({
 		.x = p.x + (pad + local.x) * s, .y = p.y + (pad + local.y) * s,
 		.width = math::max(1.5f, 2 * s), .height = render::LINE_HEIGHT * s
@@ -908,8 +975,8 @@ fn void Ui.draw_toast(&self, App* a, Input* in)
 
 fn void Ui.draw_empty_hint(&self, App* a, Input* in)
 {
-	if (a.board.items.len() || a.mode != IDLE) return;
-	Paper paper = render::PAPERS[a.paper % render::PAPERS.len];
+	if (a.tab.board.items.len() || a.mode != IDLE) return;
+	Paper paper = render::PAPERS[a.tab.paper % render::PAPERS.len];
 	Rgba color = paper.mark;
 	color.a = 170;
 	String[*] lines = { "This board is empty and goes on forever.", "Draw, or drop and paste pictures here. Press F1 for shortcuts." };
@@ -954,7 +1021,7 @@ fn void Ui.draw(&self, App* a, Input* in)
 	self.draw_marquee(a, in);
 	self.draw_caret(a, in);
 	self.draw_empty_hint(a, in);
-	self.draw_title(a, in);
+	self.draw_tabs(a, in);
 	self.draw_rail(a, in);
 	self.draw_top(a, in);
 	self.draw_bar(a, in);
@@ -968,7 +1035,7 @@ fn void Ui.draw(&self, App* a, Input* in)
 	if (self.recoloring && !in.left_down)
 	{
 		self.recoloring = false;
-		a.board.commit();
+		a.tab.board.commit();
 	}
 	if (a.tool != tool_before) self.picker_open = false;
 }

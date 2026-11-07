@@ -54,6 +54,8 @@ struct Asset
 	ulong hash;
 	RLTexture2D texture;
 	TextureState state;
+	long texture_bytes;
+	ulong last_drawn; // the renderer's frame count
 }
 
 struct Item
@@ -310,6 +312,20 @@ fn Asset* Board.add_asset(&self, char[] bytes, String extension, int width, int 
 	asset.hash = hash;
 	self.assets.push(asset);
 	return asset;
+}
+
+<*
+ Gives the board its own copy of a picture from elsewhere, unless it already has it.
+*>
+fn Asset* Board.adopt_asset(&self, Asset* source)
+{
+	foreach (asset : self.assets)
+	{
+		if (asset == source || (asset.hash == source.hash && asset.bytes.len == source.bytes.len)) return asset;
+	}
+	char[] bytes = mem::new_array(char, source.bytes.len);
+	bytes[..] = source.bytes[..];
+	return self.add_asset(bytes, source.extension, source.width, source.height, source.hash);
 }
 
 // Records the state of an item once per action, the first time it is about to change.

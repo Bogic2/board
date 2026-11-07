@@ -12,7 +12,11 @@ const float HANDLE_REACH = 11;
 const float NOTE_SIZE = 240;
 const double AUTOSAVE_DELAY = 1.0;
 const double AUTOSAVE_RETRY = 30.0;
+const double QUIT_CONFIRM_SECONDS = 10.0;
 const String CLIP_MARKER = "tabla:board-items";
+const int MAX_TABS = 5;
+
+extern fn ZString c_realpath(ZString path, char* resolved) @cname("realpath");
 
 enum Tool : char
 {
@@ -81,15 +85,33 @@ struct Pose
 	double scale;
 }
 
-struct App
+// One open board, with everything that belongs to it rather than to the window.
+struct Tab
 {
-	Input input;
+	uint serial; // never reused, so that a dialog can tell when its tab has closed
 	Board board;
-	Renderer gfx;
 	Camera cam;
 	Camera cam_target;
 	char paper;
 	char pattern;
+	String path; // empty when the board has no file
+	ulong saved_revision;
+	bool view_dirty;
+	bool save_failed;
+	double last_change_time;
+	double next_save_time;
+	ulong seen_revision;
+}
+
+struct App
+{
+	Input input;
+	Renderer gfx;
+	Tab* tab; // the one on screen
+	Tab*[MAX_TABS] tabs;
+	int tab_count;
+	uint last_serial;
+	uint dialog_tab;
 
 	Tool tool;
 	PenStyle[Tool::len] styles;
@@ -115,13 +137,8 @@ struct App
 	double caret_blink;
 
 	List{Item} clip_items;
+	Board clip_board; // owns copied pictures: the tab they came from can close before the paste
 
-	String path; // empty when the board has no file
-	ulong saved_revision;
-	bool view_dirty;
-	double last_change_time;
-	double next_save_time;
-	ulong seen_revision;
 	Vec2 drop_offset;
 
 	char[200] toast_buffer;
@@ -129,6 +146,7 @@ struct App
 	double toast_until;
 
 	bool quit;
+	double quit_confirm_until;
 	bool scripted; // driven by the end-to-end tests: never wait for real events
 	bool cursor_hidden;
 	bool help_open;
@@ -165,48 +183,56 @@ fn void App.set_default_styles(&self)
 
 fn void App.reset_view(&self)
 {
-	self.cam = { .origin = { 0, 0 }, .zoom = 1 };
-	self.cam_target = self.cam;
+	self.tab.cam = { .origin = { 0, 0 }, .zoom = 1 };
+	self.tab.cam_target = self.tab.cam;
 }
 
 fn void App.init(&self, String path)
 {
 	self.gfx.init();
-	self.board.init();
+	self.clip_board.init();
 	self.selection.init(mem);
 	self.poses.init(mem);
 	self.edit_text.init(mem);
 	self.clip_items.init(mem);
 	self.capture.points.init(mem);
 	self.set_default_styles();
-	self.reset_view();
 	self.tool = PEN;
 	self.input.width = rl::get_screen_width();
 	self.input.height = rl::get_screen_height();
+	self.open_or_create(path);
+}
+
+<*
+ Shows the board in `path` in a tab, starting a new one if there is no such file yet.
+*>
+fn void App.open_or_create(&self, String path)
+{
+	if (try open = self.find_tab(path))
+	{
+		self.show_tab(open);
+		return;
+	}
+	if (!self.has_room()) return;
 	if (file::exists(path))
 	{
-		self.open(path);
-		if (self.path.len) return;
+		if (self.open(path)) return;
 		// The file is damaged, and it stays as it is for the user to look at. New work
 		// goes next to it, so that it is saved all the same.
 		String fallback = path.tconcat(".recovered.tabla");
-		if (file::exists(fallback))
-		{
-			self.open(fallback);
-			if (self.path.len) return;
-		}
+		if (file::exists(fallback) && self.open(fallback)) return;
 		path = fallback;
 	}
-	self.path = path.copy(mem);
-	self.update_title();
+	Board next;
+	next.init();
+	self.add_tab(&next, { .zoom = 1 }, path);
 }
 
 fn void App.update_title(&self)
 {
 	@pool()
 	{
-		String name = self.path.len ? self.path.file_tbasename() ?? self.path : "unsaved board";
-		rl::set_window_title(string::tformat_zstr("%s - Tabla", name));
+		rl::set_window_title(string::tformat_zstr("%s - Tabla", self.tab.name()));
 	};
 }
 
@@ -214,15 +240,18 @@ fn void App.clear_clip(&self)
 {
 	foreach (&item : self.clip_items) item.release();
 	self.clip_items.clear();
+	self.clip_board.free();
+	self.clip_board.init();
 }
 
 fn void App.shutdown(&self)
 {
-	if (self.edit_id) self.finish_edit();
-	self.save_now(true);
+	self.settle();
+	foreach (tab : self.open_tabs()) self.save_tab(tab, tab == self.tab);
 	self.clear_clip();
 	self.clip_items.free();
-	self.board.free();
+	self.clip_board.free();
+	foreach (tab : self.open_tabs()) tab.free();
 	self.gfx.free();
 	self.selection.free();
 	self.poses.free();
@@ -230,35 +259,97 @@ fn void App.shutdown(&self)
 	self.capture.points.free();
 }
 
-fn bool App.has_unsaved(&self) => self.path.len && self.board.revision != self.saved_revision;
+fn bool Tab.has_unsaved(&self) => self.path.len && self.board.revision != self.saved_revision;
 
-fn store::View App.view(&self) => { .origin = self.cam.origin, .zoom = self.cam.zoom, .paper = self.paper, .pattern = self.pattern };
+fn store::View Tab.view(&self) => { .origin = self.cam.origin, .zoom = self.cam.zoom, .paper = self.paper, .pattern = self.pattern };
 
-fn bool App.save_now(&self, bool quiet = false)
+fn String Tab.name(&self)
 {
-	if (!self.path.len) return false;
-	if (!quiet && !self.has_unsaved() && !self.view_dirty) return true;
-	if (catch excuse = store::save(&self.board, self.view(), self.path))
+	if (!self.path.len) return "Unsaved board";
+	String name = self.path.file_tbasename() ?? self.path;
+	return name.ends_with(".tabla") ? name[:name.len - 6] : name;
+}
+
+fn void Tab.free(&self)
+{
+	self.board.free();
+	if (self.path.ptr) free(self.path.ptr);
+	free(self);
+}
+
+fn Tab*[] App.open_tabs(&self) => self.tabs[:self.tab_count];
+
+<*
+ Writes a board to its file. Without `force`, a board with nothing new in it is left as
+ it is.
+
+ @return "whether the file now holds the board"
+*>
+fn bool App.save_tab(&self, Tab* tab, bool force = false)
+{
+	if (!tab.path.len) return false;
+	if (!force && !tab.has_unsaved() && !tab.view_dirty) return true;
+	if (catch excuse = store::save(&tab.board, tab.view(), tab.path))
 	{
-		self.toast("Could not save %s (%s)", self.path, excuse);
+		self.toast("Could not save %s (%s)", tab.path, excuse);
+		tab.save_failed = true;
 		return false;
 	}
-	self.saved_revision = self.board.revision;
-	self.view_dirty = false;
+	tab.saved_revision = tab.board.revision;
+	tab.view_dirty = false;
+	tab.save_failed = false;
 	return true;
 }
 
+fn bool App.save_now(&self, bool force = false) => self.save_tab(self.tab, force);
+
+// Tabs on screen or not, boards save themselves a moment after they last changed.
 fn void App.autosave(&self)
 {
 	double now = self.input.time;
-	if (self.board.revision != self.seen_revision)
+	foreach (tab : self.open_tabs())
 	{
-		self.seen_revision = self.board.revision;
-		self.last_change_time = now;
+		if (tab.board.revision != tab.seen_revision)
+		{
+			tab.seen_revision = tab.board.revision;
+			tab.last_change_time = now;
+		}
+		if (!tab.has_unsaved()) continue;
+		if (tab == self.tab && (self.mode != IDLE || self.edit_id)) continue;
+		if (now < tab.next_save_time || now - tab.last_change_time < AUTOSAVE_DELAY) continue;
+		if (!self.save_tab(tab)) tab.next_save_time = now + AUTOSAVE_RETRY;
 	}
-	if (!self.has_unsaved() || self.mode != IDLE || self.edit_id) return;
-	if (now < self.next_save_time || now - self.last_change_time < AUTOSAVE_DELAY) return;
-	if (!self.save_now()) self.next_save_time = now + AUTOSAVE_RETRY;
+}
+
+<*
+ Keeps picture textures within the budget by dropping the ones drawn longest ago, which
+ are normally those in other tabs. Whatever is on screen stays, even over the budget.
+*>
+fn void App.limit_textures(&self)
+{
+	long used = 0;
+	foreach (tab : self.open_tabs())
+	{
+		foreach (asset : tab.board.assets)
+		{
+			if (asset.state == READY) used += asset.texture_bytes;
+		}
+	}
+	while (used > self.gfx.texture_budget)
+	{
+		Asset* oldest = null;
+		foreach (tab : self.open_tabs())
+		{
+			foreach (asset : tab.board.assets)
+			{
+				if (asset.state != READY || asset.last_drawn == self.gfx.frame) continue;
+				if (!oldest || asset.last_drawn < oldest.last_drawn) oldest = asset;
+			}
+		}
+		if (!oldest) return;
+		used -= oldest.texture_bytes;
+		render::drop_texture(oldest);
+	}
 }
 
 fn void App.forget_board_state(&self)
@@ -266,32 +357,145 @@ fn void App.forget_board_state(&self)
 	self.selection.clear();
 	self.hover_id = 0;
 	self.mode = IDLE;
-	self.clear_clip(); // the copied pictures belong to the board being closed
 }
 
-fn void App.install_board(&self, Board* next, store::View view, String path)
+// Paths differ in many ways that lead to one file, and two tabs on one file would
+// overwrite each other's work.
+fn bool same_file(String a, String b) @local
 {
+	if (a == b) return true;
+	char[4096] real_a;
+	char[4096] real_b;
+	@pool()
+	{
+		if (!c_realpath(a.zstr_tcopy(), &real_a) || !c_realpath(b.zstr_tcopy(), &real_b)) return false;
+	};
+	return ((ZString)&real_a).str_view() == ((ZString)&real_b).str_view();
+}
+
+excuse NOT_OPEN;
+
+fn Tab*? App.find_tab(&self, String path)
+{
+	foreach (tab : self.open_tabs())
+	{
+		if (same_file(tab.path, path)) return tab;
+	}
+	return NOT_OPEN~;
+}
+
+fn int App.tab_index(&self, Tab* tab)
+{
+	foreach (i, known : self.open_tabs())
+	{
+		if (known == tab) return (int)i;
+	}
+	unreachable("not an open tab");
+}
+
+fn bool App.has_room(&self)
+{
+	if (self.tab_count < MAX_TABS) return true;
+	self.toast("%d boards are open. Close one first.", MAX_TABS);
+	return false;
+}
+
+fn void App.show_tab(&self, Tab* tab)
+{
+	if (tab == self.tab) return;
+	if (self.tab) self.settle();
 	self.forget_board_state();
-	self.board.free();
-	self.board = *next;
-	self.cam = { .origin = view.origin, .zoom = math::clamp(view.zoom, MIN_ZOOM, MAX_ZOOM) };
-	self.cam_target = self.cam;
-	self.paper = view.paper;
-	self.pattern = view.pattern;
-	if (self.path.ptr) free(self.path.ptr);
-	self.path = path.copy(mem);
-	self.saved_revision = self.board.revision;
-	self.seen_revision = self.board.revision;
-	self.view_dirty = false;
+	self.tab = tab;
+	self.tab.board.sync();
 	self.update_title();
 }
 
-<*
- Switches to the board in `path`. If it cannot be read the current board stays open, and
- the file is left alone: autosave must never replace a board that merely failed to load.
-*>
-fn void App.open(&self, String path)
+fn void App.cycle_tab(&self, int step)
 {
+	self.show_tab(self.tabs[(self.tab_index(self.tab) + step + self.tab_count) % self.tab_count]);
+}
+
+// Takes ownership of `board` and shows it. The caller has checked that there is room.
+fn void App.add_tab(&self, Board* board, store::View view, String path)
+{
+	Tab* tab = mem::new(Tab);
+	tab.serial = ++self.last_serial;
+	tab.board = *board;
+	tab.cam = { .origin = view.origin, .zoom = math::clamp(view.zoom, MIN_ZOOM, MAX_ZOOM) };
+	tab.cam_target = tab.cam;
+	tab.paper = view.paper;
+	tab.pattern = view.pattern;
+	tab.path = path.copy(mem);
+	tab.saved_revision = tab.board.revision;
+	tab.seen_revision = tab.board.revision;
+	self.tabs[self.tab_count++] = tab;
+	self.show_tab(tab);
+}
+
+<*
+ Closes a tab, unless that would lose work: a board that cannot be saved stays open.
+
+ @return "whether the tab has closed"
+*>
+fn bool App.close_tab(&self, Tab* tab)
+{
+	if (self.tab_count == 1)
+	{
+		self.toast("This is the only open board");
+		return false;
+	}
+	if (tab == self.tab) self.settle();
+	if (!self.save_tab(tab))
+	{
+		@pool()
+		{
+			self.toast("Could not save %s, so it stays open", tab.name());
+		};
+		return false;
+	}
+	int index = self.tab_index(tab);
+	if (tab == self.tab) self.show_tab(self.tabs[index + 1 < self.tab_count ? index + 1 : index - 1]);
+	for (int i = index; i + 1 < self.tab_count; i++) self.tabs[i] = self.tabs[i + 1];
+	self.tab_count--;
+	tab.free();
+	return true;
+}
+
+<*
+ Quits once every board is on disk. If one cannot be saved the window stays, and only a
+ second close soon after gives up that work.
+*>
+fn void App.request_quit(&self)
+{
+	self.settle();
+	bool saved = true;
+	foreach (tab : self.open_tabs())
+	{
+		if (!self.save_tab(tab)) saved = false;
+	}
+	if (saved || self.input.time < self.quit_confirm_until)
+	{
+		self.quit = true;
+		return;
+	}
+	self.quit_confirm_until = self.input.time + QUIT_CONFIRM_SECONDS;
+	self.toast("Some boards could not be saved. Close the window again to quit anyway.");
+}
+
+<*
+ Shows the board in `path`, in a new tab unless it is already open. A file that cannot
+ be read is left alone: autosave must never replace a board that merely failed to load.
+
+ @return "whether the board is now on screen"
+*>
+fn bool App.open(&self, String path)
+{
+	if (try open = self.find_tab(path))
+	{
+		self.show_tab(open);
+		return true;
+	}
+	if (!self.has_room()) return false;
 	Board next;
 	next.init();
 	store::View? view = store::load(&next, path);
@@ -299,27 +503,58 @@ fn void App.open(&self, String path)
 	{
 		next.free();
 		self.toast("Could not open %s (%s)", path, excuse);
-		return;
+		return false;
 	}
-	self.save_now();
-	self.install_board(&next, view, path);
+	self.add_tab(&next, view, path);
+	return true;
 }
 
 fn void App.new_board(&self, String path)
 {
-	self.save_now();
+	if (try open = self.find_tab(path))
+	{
+		self.toast("That board is already open");
+		self.show_tab(open);
+		return;
+	}
+	if (!self.has_room()) return;
 	Board next;
 	next.init();
-	self.install_board(&next, { .zoom = 1, .paper = self.paper, .pattern = self.pattern }, path);
-	self.reset_view();
-	self.save_now(true);
+	store::View view = { .zoom = 1, .paper = self.tab.paper, .pattern = self.tab.pattern };
+	if (catch excuse = store::save(&next, view, path))
+	{
+		next.free();
+		self.toast("Could not create %s (%s)", path, excuse);
+		return;
+	}
+	self.add_tab(&next, view, path);
 }
 
+<*
+ Moves the board to `path`. Until that has worked the board keeps its old file, which
+ autosave can still reach.
+*>
 fn void App.save_as(&self, String path)
 {
-	if (self.path.ptr) free(self.path.ptr);
-	self.path = path.copy(mem);
-	if (self.save_now(true)) self.toast("Saved");
+	if (try open = self.find_tab(path))
+	{
+		if (open != self.tab)
+		{
+			self.toast("That file is open in another tab");
+			return;
+		}
+	}
+	if (catch excuse = store::save(&self.tab.board, self.tab.view(), path))
+	{
+		self.toast("Could not save %s (%s)", path, excuse);
+		return;
+	}
+	if (self.tab.path.ptr) free(self.tab.path.ptr);
+	self.tab.path = path.copy(mem);
+	self.tab.saved_revision = self.tab.board.revision;
+	self.tab.view_dirty = false;
+	self.tab.save_failed = false;
+	self.toast("Saved");
 	self.update_title();
 }
 
@@ -329,11 +564,29 @@ fn void App.save_as(&self, String path)
 fn void App.settle(&self)
 {
 	if (self.edit_id) self.finish_edit();
-	self.board.commit();
+	self.tab.board.commit();
+}
+
+<*
+ Shows the tab a dialog was opened from, which may no longer be the one on screen.
+
+ @return "false if that tab has closed since"
+*>
+fn bool App.show_dialog_tab(&self)
+{
+	foreach (tab : self.open_tabs())
+	{
+		if (tab.serial != self.dialog_tab) continue;
+		self.show_tab(tab);
+		return true;
+	}
+	self.toast("That board has been closed");
+	return false;
 }
 
 fn void App.handle_dialog(&self)
 {
+	if (self.mode != IDLE) return; // what the pointer is doing finishes first
 	Request request;
 	String reply;
 	switch (dialog::poll(&request, &reply))
@@ -345,14 +598,17 @@ fn void App.handle_dialog(&self)
 			switch (request)
 			{
 				case OPEN_BOARD: self.open(reply);
-				case SAVE_BOARD: self.save_as(with_extension(reply, ".tabla"));
 				case NEW_BOARD: self.new_board(with_extension(reply, ".tabla"));
+				case SAVE_BOARD:
+					if (self.show_dialog_tab()) self.save_as(with_extension(reply, ".tabla"));
 				case ADD_IMAGES:
+					if (!self.show_dialog_tab()) break;
 					@pool()
 					{
 						self.add_files(reply.tsplit("\n"), self.view_center());
 					};
-				case EXPORT_PNG: self.export_board(with_extension(reply, ".png"));
+				case EXPORT_PNG:
+					if (self.show_dialog_tab()) self.export_board(with_extension(reply, ".png"));
 			}
 		default:
 			break;
@@ -368,8 +624,8 @@ fn Vec2 App.view_center(&self) => { self.input.width * 0.5f, self.input.height *
 
 fn void App.export_board(&self, String path)
 {
-	self.board.sync();
-	DRect? area = self.selection.len() ? self.selection_bounds() : self.board.extent();
+	self.tab.board.sync();
+	DRect? area = self.selection.len() ? self.selection_bounds() : self.tab.board.extent();
 	if (catch area)
 	{
 		self.toast("Nothing to export yet");
@@ -380,7 +636,7 @@ fn void App.export_board(&self, String path)
 	area.hi += margin;
 	@pool()
 	{
-		if (self.gfx.export_png(&self.board, area, self.paper, path.zstr_tcopy()))
+		if (self.gfx.export_png(&self.tab.board, area, self.tab.paper, path.zstr_tcopy()))
 		{
 			self.toast("Exported %s", path);
 		}
@@ -433,15 +689,15 @@ fn Item*? App.add_picture(&self, char[] bytes, DVec2 center)
 	defer rl::unload_image(image);
 
 	render::orient_image(&image, geom::jpeg_orientation(bytes));
-	Asset* asset = self.board.add_asset(bytes, extension, image.width, image.height, fnv64a::hash(bytes));
+	Asset* asset = self.tab.board.add_asset(bytes, extension, image.width, image.height, fnv64a::hash(bytes));
 	if (asset.state == UNLOADED) render::upload_picture(asset, &image);
 
 	// Keep the original pixel size unless that would not fit comfortably on screen.
 	double fit = math::min(self.input.width * 0.6 / asset.width, self.input.height * 0.6 / asset.height, 1.0);
-	double scale = fit / self.cam.zoom;
+	double scale = fit / self.tab.cam.zoom;
 	Vec2 size = { (float)asset.width, (float)asset.height };
 	DVec2 pos = center - (DVec2)size * scale * 0.5;
-	return self.board.add({ .kind = IMAGE, .pos = pos, .scale = scale, .size = size, .asset = asset });
+	return self.tab.board.add({ .kind = IMAGE, .pos = pos, .scale = scale, .size = size, .asset = asset });
 }
 
 fn void App.select_only_new(&self, uint[] ids)
@@ -453,20 +709,19 @@ fn void App.select_only_new(&self, uint[] ids)
 
 fn void App.add_files(&self, String[] paths, Vec2 at)
 {
+	// Boards first: pictures dropped along with one go on the board that ends up open.
+	foreach (path : paths)
+	{
+		if (path.ends_with(".tabla")) self.open(path);
+	}
 	List{uint} added;
 	added.init(mem);
 	defer added.free();
-	DVec2 center = self.cam.to_world(at);
-	double step = 28 / self.cam.zoom;
+	DVec2 center = self.tab.cam.to_world(at);
+	double step = 28 / self.tab.cam.zoom;
 	foreach (path : paths)
 	{
-		if (!path.len) continue;
-		if (path.ends_with(".tabla"))
-		{
-			self.settle();
-			self.open(path);
-			return;
-		}
+		if (!path.len || path.ends_with(".tabla")) continue;
 		char[]? bytes = file::load(mem, path);
 		if (catch bytes)
 		{
@@ -481,8 +736,9 @@ fn void App.add_files(&self, String[] paths, Vec2 at)
 		}
 		added.push(item.id);
 		center += step;
+		self.limit_textures();
 	}
-	self.board.commit();
+	self.tab.board.commit();
 	if (added.len()) self.select_only_new(added.array_view());
 }
 
@@ -505,7 +761,7 @@ fn Item*[] App.group(&self, Allocator allocator = tmem)
 	foreach (id : self.selection) chosen[id] = true;
 	List{Item*} group;
 	group.init(allocator);
-	foreach (item : self.board.items)
+	foreach (item : self.tab.board.items)
 	{
 		if (item.dead) continue;
 		if (chosen.has_key(item.id) || (item.parent && chosen.has_key(item.parent))) group.push(item);
@@ -518,7 +774,7 @@ fn DRect? App.selection_bounds(&self)
 	DRect? box = NOT_SELECTED~;
 	foreach (id : self.selection)
 	{
-		Item*? item = self.board.get(id);
+		Item*? item = self.tab.board.get(id);
 		if (catch item) continue;
 		if (try known = box)
 		{
@@ -539,7 +795,7 @@ fn void App.prune_selection(&self)
 	sz out = 0;
 	foreach (id : self.selection)
 	{
-		if (self.board.by_id.has_key(id)) self.selection[out++] = id;
+		if (self.tab.board.by_id.has_key(id)) self.selection[out++] = id;
 	}
 	while (self.selection.len() > out) (void)self.selection.pop();
 }
@@ -565,22 +821,22 @@ fn void App.set_tool(&self, Tool tool)
 fn void App.undo(&self)
 {
 	self.settle();
-	if (self.board.undo()) self.prune_selection();
+	if (self.tab.board.undo()) self.prune_selection();
 }
 
 fn void App.redo(&self)
 {
 	self.settle();
-	if (self.board.redo()) self.prune_selection();
+	if (self.tab.board.redo()) self.prune_selection();
 }
 
 fn void App.delete_selection(&self)
 {
 	@pool()
 	{
-		foreach (item : self.group()) self.board.remove(item);
+		foreach (item : self.group()) self.tab.board.remove(item);
 	};
-	self.board.commit();
+	self.tab.board.commit();
 	self.selection.clear();
 }
 
@@ -588,9 +844,9 @@ fn void App.bring_to_front(&self)
 {
 	@pool()
 	{
-		foreach (item : self.group()) self.board.bring_to_front(item);
+		foreach (item : self.group()) self.tab.board.bring_to_front(item);
 	};
-	self.board.commit();
+	self.tab.board.commit();
 }
 
 fn void App.send_to_back(&self)
@@ -598,9 +854,9 @@ fn void App.send_to_back(&self)
 	@pool()
 	{
 		Item*[] group = self.group();
-		for (sz i = group.len; i > 0; i--) self.board.send_to_back(group[i - 1]);
+		for (sz i = group.len; i > 0; i--) self.tab.board.send_to_back(group[i - 1]);
 	};
-	self.board.commit();
+	self.tab.board.commit();
 }
 
 fn void App.collect_selection(&self, List{Item}* out)
@@ -620,6 +876,10 @@ fn void App.copy(&self)
 {
 	self.clear_clip();
 	self.collect_selection(&self.clip_items);
+	foreach (&item : self.clip_items)
+	{
+		if (item.kind == IMAGE) item.asset = self.clip_board.adopt_asset(item.asset);
+	}
 	// The items stay in memory; the marker tells a later paste that nothing newer was
 	// copied elsewhere in the meantime.
 	if (self.scripted) return;
@@ -648,12 +908,13 @@ fn void App.place_copies(&self, List{Item}* items, DVec2 center)
 	foreach (&source : items)
 	{
 		Item copy = *source;
+		if (copy.kind == IMAGE) copy.asset = self.tab.board.adopt_asset(copy.asset);
 		copy.retain();
 		copy.id = 0;
 		copy.z = 0;
 		copy.pos += shift;
 		copy.parent = 0;
-		Item* placed = self.board.add(copy);
+		Item* placed = self.tab.board.add(copy);
 		new_ids[source.id] = placed.id;
 		if (!source.parent || !list_contains(items, source.parent)) added.push(placed.id);
 	}
@@ -662,9 +923,9 @@ fn void App.place_copies(&self, List{Item}* items, DVec2 center)
 	{
 		if (!source.parent) continue;
 		uint? parent = new_ids.get(source.parent);
-		if (try parent) self.board.get(new_ids[source.id]!!)!!.parent = parent;
+		if (try parent) self.tab.board.get(new_ids[source.id]!!)!!.parent = parent;
 	}
-	self.board.commit();
+	self.tab.board.commit();
 	self.select_only_new(added.array_view());
 }
 
@@ -690,7 +951,7 @@ fn void App.duplicate(&self)
 		copies.free();
 	}
 	self.collect_selection(&copies);
-	self.place_copies(&copies, (box.lo + box.hi) * 0.5 + 24 / self.cam.zoom);
+	self.place_copies(&copies, (box.lo + box.hi) * 0.5 + 24 / self.tab.cam.zoom);
 }
 
 fn void App.paste(&self, Vec2 at)
@@ -707,14 +968,14 @@ fn void App.paste_content(&self, clip::Content* content, Vec2 at)
 		case PICTURE:
 			char[] bytes = mem::new_array(char, content.bytes.len());
 			bytes[..] = content.bytes.array_view()[..];
-			Item*? item = self.add_picture(bytes, self.cam.to_world(at));
+			Item*? item = self.add_picture(bytes, self.tab.cam.to_world(at));
 			if (catch excuse = item)
 			{
 				self.report_picture_error(excuse, "the clipboard");
 				return;
 			}
 			uint[1] id = { item.id };
-			self.board.commit();
+			self.tab.board.commit();
 			self.select_only_new(&id);
 		case FILES:
 			@pool()
@@ -727,11 +988,11 @@ fn void App.paste_content(&self, clip::Content* content, Vec2 at)
 			String value = text ? text.str_view() : "";
 			if (value == CLIP_MARKER)
 			{
-				self.place_copies(&self.clip_items, self.cam.to_world(at));
+				self.place_copies(&self.clip_items, self.tab.cam.to_world(at));
 			}
 			else if (value.len)
 			{
-				self.place_text(value, self.cam.to_world(at));
+				self.place_text(value, self.tab.cam.to_world(at));
 			}
 			else
 			{
@@ -744,18 +1005,18 @@ fn void App.place_text(&self, String text, DVec2 world)
 {
 	Vec2 size = self.gfx.measure(text, 0);
 	double scale = self.text_scale();
-	Item* item = self.board.add({
+	Item* item = self.tab.board.add({
 		.kind = TEXT, .pos = world - (DVec2)size * scale * 0.5, .scale = scale, .size = size,
 		.color = self.styles[Tool.TEXT.ordinal].color, .text = board::text_new(text)
 	});
 	uint[1] id = { item.id };
-	self.board.commit();
+	self.tab.board.commit();
 	self.select_only_new(&id);
 }
 
 fn double App.text_scale(&self)
 {
-	return (double)(self.styles[Tool.TEXT.ordinal].size / render::TEXT_SIZE) / self.cam.zoom;
+	return (double)(self.styles[Tool.TEXT.ordinal].size / render::TEXT_SIZE) / self.tab.cam.zoom;
 }
 
 <*
@@ -766,29 +1027,29 @@ fn void App.recolor_selection(&self, Rgba color, bool commit = true)
 {
 	foreach (id : self.selection)
 	{
-		Item*? item = self.board.get(id);
+		Item*? item = self.tab.board.get(id);
 		if (catch item) continue;
 		if (item.kind == IMAGE) continue;
 		if (item.kind == TEXT && item.fill.a)
 		{
-			self.board.touch(item).fill = color;
+			self.tab.board.touch(item).fill = color;
 			continue;
 		}
 		color.a = item.color.a;
-		self.board.touch(item).color = color;
+		self.tab.board.touch(item).color = color;
 	}
-	if (commit) self.board.commit();
+	if (commit) self.tab.board.commit();
 }
 
 // View
 
 fn void App.zoom_at(&self, Vec2 screen, double factor)
 {
-	Camera* t = &self.cam_target;
+	Camera* t = &self.tab.cam_target;
 	DVec2 anchor = t.to_world(screen);
 	t.zoom = math::clamp(t.zoom * factor, MIN_ZOOM, MAX_ZOOM);
 	t.origin = anchor - (DVec2)screen / t.zoom;
-	self.view_dirty = true;
+	self.tab.view_dirty = true;
 }
 
 fn void App.fit_view(&self, DRect box)
@@ -796,28 +1057,28 @@ fn void App.fit_view(&self, DRect box)
 	DVec2 size = box.size();
 	double zoom = math::min(self.input.width * 0.86 / math::max(size.x, 1e-9), self.input.height * 0.8 / math::max(size.y, 1e-9));
 	zoom = math::clamp(zoom, MIN_ZOOM, MAX_ZOOM);
-	self.cam_target.zoom = zoom;
-	self.cam_target.origin = (box.lo + box.hi) * 0.5 - (DVec2)self.view_center() / zoom;
-	self.view_dirty = true;
+	self.tab.cam_target.zoom = zoom;
+	self.tab.cam_target.origin = (box.lo + box.hi) * 0.5 - (DVec2)self.view_center() / zoom;
+	self.tab.view_dirty = true;
 }
 
 fn void App.fit_all(&self)
 {
-	DRect? box = self.board.extent();
+	DRect? box = self.tab.board.extent();
 	if (try box)
 	{
 		self.fit_view(box);
 	}
 	else
 	{
-		self.cam_target = { .origin = { 0, 0 }, .zoom = 1 };
+		self.tab.cam_target = { .origin = { 0, 0 }, .zoom = 1 };
 	}
 }
 
 fn bool App.camera_moving(&self)
 {
-	Camera* a = &self.cam;
-	Camera* b = &self.cam_target;
+	Camera* a = &self.tab.cam;
+	Camera* b = &self.tab.cam_target;
 	return a.zoom != b.zoom || a.origin != b.origin;
 }
 
@@ -829,8 +1090,8 @@ fn bool App.camera_moving(&self)
 fn void App.step_camera(&self, float dt)
 {
 	if (!self.camera_moving()) return;
-	Camera* c = &self.cam;
-	Camera* t = &self.cam_target;
+	Camera* c = &self.tab.cam;
+	Camera* t = &self.tab.cam_target;
 	double k = 1 - math::exp(-(double)math::clamp(dt, 0.0f, 0.1f) * 20);
 	double ratio = t.zoom / c.zoom;
 	double zoom = c.zoom * math::pow(ratio, k);
@@ -852,10 +1113,10 @@ fn void App.step_camera(&self, float dt)
 
 fn void App.pan_by(&self, Vec2 delta)
 {
-	DVec2 shift = (DVec2)delta / self.cam.zoom;
-	self.cam.origin -= shift;
-	self.cam_target.origin -= shift;
-	self.view_dirty = true;
+	DVec2 shift = (DVec2)delta / self.tab.cam.zoom;
+	self.tab.cam.origin -= shift;
+	self.tab.cam_target.origin -= shift;
+	self.tab.view_dirty = true;
 }
 
 // Ink
@@ -864,7 +1125,7 @@ fn void App.begin_stroke(&self, DVec2 world)
 {
 	Capture* c = &self.capture;
 	PenStyle* style = &self.styles[self.tool.ordinal];
-	float width = style.size / (float)self.cam.zoom;
+	float width = style.size / (float)self.tab.cam.zoom;
 	c.points.clear();
 	c.origin = world;
 	c.filtered = { 0, 0 };
@@ -881,7 +1142,7 @@ fn void App.begin_stroke(&self, DVec2 world)
 	c.points.push({ 0, 0, width });
 
 	// Ink that starts on a picture belongs to it, and travels with it from now on.
-	Item*? below = self.board.item_at(world, 0, images_only: true);
+	Item*? below = self.tab.board.item_at(world, 0, images_only: true);
 	c.parent = 0;
 	if (try below) c.parent = below.id;
 }
@@ -889,10 +1150,10 @@ fn void App.begin_stroke(&self, DVec2 world)
 fn void App.add_sample(&self, Sample sample)
 {
 	Capture* c = &self.capture;
-	Vec2 local = (Vec2)(self.cam.to_world(sample.pos) - c.origin);
+	Vec2 local = (Vec2)(self.tab.cam.to_world(sample.pos) - c.origin);
 	c.raw = local;
 	c.filtered += (local - c.filtered) * c.follow;
-	float pixel = 1 / (float)self.cam.zoom;
+	float pixel = 1 / (float)self.tab.cam.zoom;
 	Vec2 last = geom::pos_of(c.points[c.points.len() - 1]);
 	float moved = geom::length(c.filtered - last);
 	if (moved < pixel * 0.75f) return;
@@ -912,7 +1173,7 @@ fn void App.finish_stroke(&self)
 	Capture* c = &self.capture;
 	Vec2 last = geom::pos_of(c.points[c.points.len() - 1]);
 	// The stabiliser lags behind the pen: the stroke should still end at the pen.
-	if (geom::length(c.raw - last) > 0.5f / (float)self.cam.zoom) c.points.push({ c.raw.x, c.raw.y, c.width });
+	if (geom::length(c.raw - last) > 0.5f / (float)self.tab.cam.zoom) c.points.push({ c.raw.x, c.raw.y, c.width });
 	if (c.speed_width)
 	{
 		sz n = c.points.len();
@@ -931,11 +1192,11 @@ fn void App.commit_capture(&self)
 {
 	Capture* c = &self.capture;
 	InkPoint[] points = c.points.to_array(mem);
-	self.board.add({
+	self.tab.board.add({
 		.kind = INK, .pos = c.origin, .scale = 1, .color = c.color, .parent = c.parent,
 		.ink = board::ink_new(points, c.smooth, c.tip)
 	});
-	self.board.commit();
+	self.tab.board.commit();
 }
 
 fn void App.build_shape(&self, DVec2 world, bool constrain)
@@ -960,7 +1221,7 @@ fn void App.build_shape(&self, DVec2 world, bool constrain)
 			float length = geom::length(end);
 			if (self.tool == ARROW && length > 0)
 			{
-				float head = math::min(math::max(w * 4.5f, 14 / (float)self.cam.zoom), length * 0.5f);
+				float head = math::min(math::max(w * 4.5f, 14 / (float)self.tab.cam.zoom), length * 0.5f);
 				Vec2 back = geom::normalize(end) * -head;
 				Vec2 side = geom::perp(back) * 0.55f;
 				Vec2 wing_a = end + back + side;
@@ -1000,14 +1261,14 @@ fn Vec2 square_up(Vec2 v) @local
 
 fn void App.erase_along(&self, DVec2 from, DVec2 to, bool whole_strokes)
 {
-	double radius = self.styles[Tool.ERASER.ordinal].size * 0.5 / self.cam.zoom;
+	double radius = self.styles[Tool.ERASER.ordinal].size * 0.5 / self.tab.cam.zoom;
 	DRect swept = geom::rect_of(from, to);
 	swept.lo -= radius;
 	swept.hi += radius;
-	sz count = self.board.items.len(); // items added below need no checking
+	sz count = self.tab.board.items.len(); // items added below need no checking
 	for (sz i = 0; i < count; i++)
 	{
-		Item* item = self.board.items[i];
+		Item* item = self.tab.board.items[i];
 		if (item.dead || item.kind != INK || !item.bounds().overlaps(swept)) continue;
 		self.erase_from(item, from, to, radius, whole_strokes);
 	}
@@ -1025,7 +1286,7 @@ fn void App.erase_from(&self, Item* item, DVec2 from, DVec2 to, double radius, b
 	if (whole_strokes)
 	{
 		foreach (run : runs) free(run.ptr);
-		self.board.remove(item);
+		self.tab.board.remove(item);
 		return;
 	}
 	foreach (run : runs)
@@ -1033,16 +1294,16 @@ fn void App.erase_from(&self, Item* item, DVec2 from, DVec2 to, double radius, b
 		Item piece = *item;
 		piece.id = 0;
 		piece.ink = board::ink_new(run, item.ink.smooth, item.ink.tip);
-		self.board.add(piece);
+		self.tab.board.add(piece);
 	}
-	self.board.remove(item);
+	self.tab.board.remove(item);
 }
 
 // Text
 
 fn void App.begin_edit(&self, Item* item, bool is_new)
 {
-	self.board.touch(item);
+	self.tab.board.touch(item);
 	self.edit_id = item.id;
 	self.edit_is_new = is_new;
 	self.edit_text.clear();
@@ -1058,7 +1319,7 @@ fn String App.edit_string(&self) => (String)self.edit_text.array_view();
 // Keeps the live preview and the size of the box in step with the text being typed.
 fn void App.sync_edit(&self)
 {
-	Item*? item = self.board.get(self.edit_id);
+	Item*? item = self.tab.board.get(self.edit_id);
 	if (catch item) return;
 	String text = self.edit_string();
 	self.gfx.edit_id = item.id;
@@ -1080,19 +1341,19 @@ fn void App.finish_edit(&self)
 	uint id = self.edit_id;
 	self.edit_id = 0;
 	self.gfx.edit_id = 0;
-	Item*? item = self.board.get(id);
+	Item*? item = self.tab.board.get(id);
 	if (catch item) return;
 	String text = self.edit_string();
 	if (!text.trim().len && !item.fill.a)
 	{
-		self.board.remove(item);
+		self.tab.board.remove(item);
 	}
 	else if (text != item.text.text)
 	{
 		item.release();
 		item.text = board::text_new(text);
 	}
-	self.board.commit();
+	self.tab.board.commit();
 }
 
 fn void App.edit_insert(&self, String text)
@@ -1183,7 +1444,7 @@ fn void App.update_edit(&self, Input* in)
 
 fn void App.start_text(&self, DVec2 world)
 {
-	Item* item = self.board.add({
+	Item* item = self.tab.board.add({
 		.kind = TEXT, .pos = world, .scale = self.text_scale(), .size = { 12, render::LINE_HEIGHT },
 		.color = self.styles[Tool.TEXT.ordinal].color, .text = board::text_new("")
 	});
@@ -1192,9 +1453,9 @@ fn void App.start_text(&self, DVec2 world)
 
 fn void App.start_note(&self, DVec2 world)
 {
-	double scale = 1 / self.cam.zoom;
+	double scale = 1 / self.tab.cam.zoom;
 	DVec2 pos = world - (double)NOTE_SIZE * 0.5 * scale;
-	Item* item = self.board.add({
+	Item* item = self.tab.board.add({
 		.kind = TEXT, .pos = pos, .scale = scale, .size = { NOTE_SIZE, NOTE_SIZE },
 		.color = { 30, 30, 34, 255 }, .fill = self.styles[Tool.NOTE.ordinal].color,
 		.text = board::text_new("")
@@ -1221,8 +1482,8 @@ fn int App.handle_at(&self, Vec2 mouse)
 {
 	DRect? box = self.selection_bounds();
 	if (catch box) return -1;
-	Vec2 lo = self.cam.to_screen(box.lo);
-	Vec2 hi = self.cam.to_screen(box.hi);
+	Vec2 lo = self.tab.cam.to_screen(box.lo);
+	Vec2 hi = self.tab.cam.to_screen(box.hi);
 	Vec2[4] corners = { lo, { hi.x, lo.y }, hi, { lo.x, hi.y } };
 	foreach (i, corner : corners)
 	{
@@ -1253,9 +1514,9 @@ fn void App.apply_resize(&self, DVec2 world)
 	double factor = math::max(along, 0.02);
 	foreach (pose : self.poses)
 	{
-		Item*? item = self.board.get(pose.id);
+		Item*? item = self.tab.board.get(pose.id);
 		if (catch item) continue;
-		self.board.touch(item);
+		self.tab.board.touch(item);
 		item.pos = self.resize_anchor + (pose.pos - self.resize_anchor) * factor;
 		item.scale = pose.scale * factor;
 	}
@@ -1266,9 +1527,9 @@ fn void App.apply_move(&self, DVec2 world)
 	DVec2 shift = world - self.press_world;
 	foreach (pose : self.poses)
 	{
-		Item*? item = self.board.get(pose.id);
+		Item*? item = self.tab.board.get(pose.id);
 		if (catch item) continue;
-		self.board.touch(item).pos = pose.pos + shift;
+		self.tab.board.touch(item).pos = pose.pos + shift;
 	}
 }
 
@@ -1280,8 +1541,8 @@ fn void App.press_with_select(&self, Input* in, DVec2 world)
 		self.begin_resize(corner);
 		return;
 	}
-	double reach = 5 / self.cam.zoom;
-	Item*? item = self.board.item_at(world, reach);
+	double reach = 5 / self.tab.cam.zoom;
+	Item*? item = self.tab.board.item_at(world, reach);
 	if (catch item)
 	{
 		if (!in.shift) self.selection.clear();
@@ -1325,7 +1586,7 @@ fn void App.press_with_select(&self, Input* in, DVec2 world)
 fn void App.press_on_canvas(&self, Input* in)
 {
 	self.press_screen = in.mouse;
-	DVec2 world = self.cam.to_world(in.mouse);
+	DVec2 world = self.tab.cam.to_world(in.mouse);
 	self.press_world = world;
 	Tool tool = self.tool;
 	if (tool.is_ink())
@@ -1360,21 +1621,21 @@ fn void App.press_on_canvas(&self, Input* in)
 
 fn void App.finish_marquee(&self, Input* in)
 {
-	DRect area = geom::rect_of(self.press_world, self.cam.to_world(in.mouse));
+	DRect area = geom::rect_of(self.press_world, self.tab.cam.to_world(in.mouse));
 	HashMap{uint, bool} chosen;
 	chosen.tinit();
 	foreach (id : self.selection) chosen[id] = true;
-	foreach (item : self.board.items)
+	foreach (item : self.tab.board.items)
 	{
 		// Pinned ink travels with its picture, so only the picture needs selecting.
-		if (item.dead || (item.parent && self.board.by_id.has_key(item.parent))) continue;
+		if (item.dead || (item.parent && self.tab.board.by_id.has_key(item.parent))) continue;
 		if (item.in_rect(area) && !chosen.has_key(item.id)) self.selection.push(item.id);
 	}
 }
 
 fn void App.update_pointer(&self, Input* in, bool over_ui)
 {
-	DVec2 world = self.cam.to_world(in.mouse);
+	DVec2 world = self.tab.cam.to_world(in.mouse);
 	switch (self.mode)
 	{
 		case IDLE:
@@ -1387,7 +1648,7 @@ fn void App.update_pointer(&self, Input* in, bool over_ui)
 			{
 				bool was_typing = self.edit_id != 0;
 				if (was_typing) self.finish_edit();
-				self.board.sync();
+				self.tab.board.sync();
 				if (panning_tool)
 				{
 					self.mode = PANNING;
@@ -1401,7 +1662,7 @@ fn void App.update_pointer(&self, Input* in, bool over_ui)
 			self.hover_id = 0;
 			if (self.tool == SELECT && self.mode == IDLE && !over_ui)
 			{
-				Item*? below = self.board.item_at(world, 5 / self.cam.zoom);
+				Item*? below = self.tab.board.item_at(world, 5 / self.tab.cam.zoom);
 				if (try below) self.hover_id = below.id;
 			}
 		case PANNING:
@@ -1428,7 +1689,7 @@ fn void App.update_pointer(&self, Input* in, bool over_ui)
 			self.last_erase = world;
 			if (!in.left_down)
 			{
-				self.board.commit();
+				self.tab.board.commit();
 				self.mode = IDLE;
 			}
 		case PRESSING:
@@ -1444,14 +1705,14 @@ fn void App.update_pointer(&self, Input* in, bool over_ui)
 			self.apply_move(world);
 			if (!in.left_down)
 			{
-				self.board.commit();
+				self.tab.board.commit();
 				self.mode = IDLE;
 			}
 		case RESIZING:
 			self.apply_resize(world);
 			if (!in.left_down)
 			{
-				self.board.commit();
+				self.tab.board.commit();
 				self.mode = IDLE;
 			}
 		case MARQUEE:
@@ -1544,7 +1805,7 @@ fn void App.handle_shortcuts(&self, Input* in)
 		if (in.letter('s'))
 		{
 			self.settle();
-			if (in.shift || !self.path.len)
+			if (in.shift || !self.tab.path.len)
 			{
 				self.request_dialog(SAVE_BOARD);
 			}
@@ -1560,9 +1821,9 @@ fn void App.handle_shortcuts(&self, Input* in)
 		{
 			self.set_tool(SELECT);
 			self.selection.clear();
-			foreach (item : self.board.items)
+			foreach (item : self.tab.board.items)
 			{
-				if (!item.parent || !self.board.by_id.has_key(item.parent)) self.selection.push(item.id);
+				if (!item.parent || !self.tab.board.by_id.has_key(item.parent)) self.selection.push(item.id);
 			}
 		}
 		if (in.letter('c') && self.selection.len()) self.copy();
@@ -1573,7 +1834,7 @@ fn void App.handle_shortcuts(&self, Input* in)
 		}
 		if (in.letter('v')) self.paste(in.mouse);
 		if (in.letter('d')) self.duplicate();
-		if (in.key(ZERO)) self.zoom_at(self.view_center(), 1 / self.cam_target.zoom);
+		if (in.key(ZERO)) self.zoom_at(self.view_center(), 1 / self.tab.cam_target.zoom);
 		if (in.key(ONE)) self.fit_all();
 		return;
 	}
@@ -1605,9 +1866,9 @@ fn void App.handle_shortcuts(&self, Input* in)
 		{
 			@pool()
 			{
-				foreach (item : self.group()) self.board.touch(item).pos += (DVec2)nudge / self.cam.zoom;
+				foreach (item : self.group()) self.tab.board.touch(item).pos += (DVec2)nudge / self.tab.cam.zoom;
 			};
-			self.board.commit();
+			self.tab.board.commit();
 		}
 	}
 	else
@@ -1623,9 +1884,33 @@ fn void App.handle_shortcuts(&self, Input* in)
 	}
 }
 
+fn void App.handle_tab_keys(&self, Input* in)
+{
+	if (!in.ctrl || self.help_open || self.mode != IDLE || dialog::is_open()) return;
+	// First presses only. Input methods can repeat a key press, and between two tabs that
+	// would go there and straight back. Held down, Ctrl+W would close every tab.
+	if (in.tapped(TAB)) self.cycle_tab(in.shift ? -1 : 1);
+	if (in.tapped(PAGE_DOWN)) self.cycle_tab(1);
+	if (in.tapped(PAGE_UP)) self.cycle_tab(-1);
+	if (in.letter_tapped('w')) self.close_tab(self.tab);
+}
+
+// The tab strip is drawn while a frame is under way, so what it asks for happens here.
+fn void App.handle_tab_request(&self)
+{
+	Tab* show = self.ui.tab_to_show;
+	Tab* close = self.ui.tab_to_close;
+	self.ui.tab_to_show = null;
+	self.ui.tab_to_close = null;
+	if (show) self.show_tab(show);
+	if (close) self.close_tab(close);
+}
+
 fn void App.request_dialog(&self, Request request)
 {
 	if (dialog::is_open()) return; // a held key repeats, and one dialog is enough
+	if ((request == OPEN_BOARD || request == NEW_BOARD) && !self.has_room()) return;
+	self.dialog_tab = self.tab.serial;
 	dialog::start(request);
 }
 
@@ -1646,12 +1931,17 @@ fn void App.handle_dropped_files(&self, Input* in)
 
 fn bool App.busy(&self)
 {
-	return self.camera_moving() || self.has_unsaved() || dialog::is_open() || self.edit_id
-		|| self.input.time < self.toast_until;
+	if (self.camera_moving() || dialog::is_open() || self.edit_id || self.gfx.textures_waiting) return true;
+	foreach (tab : self.open_tabs())
+	{
+		if (tab.has_unsaved()) return true;
+	}
+	return self.input.time < self.toast_until;
 }
 
 fn void App.update(&self, Input* in, bool over_ui)
 {
+	self.handle_tab_request();
 	self.handle_dialog();
 	self.handle_dropped_files(in);
 	if (in.wheel != 0 && !over_ui && !self.help_open)
@@ -1666,6 +1956,7 @@ fn void App.update(&self, Input* in, bool over_ui)
 		}
 	}
 	self.step_camera(in.dt);
+	self.handle_tab_keys(in);
 	if (self.edit_id)
 	{
 		self.update_edit(in);
@@ -1682,16 +1973,17 @@ fn void App.update(&self, Input* in, bool over_ui)
 fn void App.frame(&self) => @pool()
 {
 	Input* in = &self.input;
-	self.board.sync();
+	self.tab.board.sync();
 	self.ui.layout(self, in);
 	bool over_ui = self.ui.covers(self, in);
 	self.update(in, over_ui);
-	self.board.sync();
+	self.tab.board.sync();
 
 	rl::begin_drawing();
 	self.gfx.begin_scene(in.width, in.height);
-	self.gfx.draw_paper(&self.cam, self.paper, self.pattern);
-	self.gfx.draw_items(&self.board, &self.cam);
+	self.gfx.draw_paper(&self.tab.cam, self.tab.paper, self.tab.pattern);
+	self.gfx.draw_items(&self.tab.board, &self.tab.cam);
+	self.limit_textures();
 	self.draw_capture();
 	self.ui.draw(self, in);
 	$if $feat(E2E):
@@ -1728,11 +2020,11 @@ fn void App.draw_capture(&self)
 	{
 		// The stored stroke lags behind the pen; show it reaching the pen tip.
 		c.points.push({ c.raw.x, c.raw.y, c.width });
-		self.gfx.draw_live(&self.cam, c.points.array_view(), c.smooth, c.tip, c.origin, c.color);
+		self.gfx.draw_live(&self.tab.cam, c.points.array_view(), c.smooth, c.tip, c.origin, c.color);
 		(void)c.points.pop();
 	}
 	else if (self.mode == SHAPING && c.points.len())
 	{
-		self.gfx.draw_live(&self.cam, c.points.array_view(), false, ROUND, c.origin, c.color);
+		self.gfx.draw_live(&self.tab.cam, c.points.array_view(), false, ROUND, c.origin, c.color);
 	}
 }

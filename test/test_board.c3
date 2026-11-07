@@ -241,3 +241,24 @@ fn void order_is_restored_after_undo_on_a_big_board() @test
 		assert(b.items[i - 1].z < b.items[i].z, "items out of order at %d", i);
 	}
 }
+
+fn void adopting_a_picture_copies_it_once() @test
+{
+	Board source = fresh();
+	defer source.free();
+	Board target = fresh();
+	defer target.free();
+	char[] bytes = mem::new_array(char, 3);
+	bytes[0] = 7;
+	Asset* original = source.add_asset(bytes, ".png", 4, 5, 99);
+
+	Asset* copy = target.adopt_asset(original);
+	assert(copy != original && copy.bytes.ptr != original.bytes.ptr);
+	assert(copy.bytes[0] == 7 && copy.extension == ".png");
+	assert(copy.width == 4 && copy.height == 5 && copy.hash == 99);
+	assert(copy.state == UNLOADED);
+
+	assert(target.adopt_asset(original) == copy);
+	assert(source.adopt_asset(original) == original);
+	assert(target.assets.len() == 1 && source.assets.len() == 1);
+}

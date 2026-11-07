@@ -14,6 +14,7 @@ const int MAX_TEXTURE_SIZE = 4096;
 const int LIVE_INITIAL_CAPACITY = 4096;
 // How many new pictures may be decoded per frame while panning across a big board.
 const int TEXTURES_PER_FRAME = 1;
+const long TEXTURE_BUDGET = 2L * 1024 * 1024 * 1024;
 
 const uint GL_FLOAT = 0x1406;
 const uint GL_STENCIL_TEST = 0x0B90;
@@ -128,6 +129,10 @@ struct Renderer
 	RLFont ui_font;
 	RLFont ui_bold;
 
+	ulong frame; // counts scenes, so that pictures can tell when they were last drawn
+	long texture_budget;
+	bool textures_waiting; // a visible picture has yet to load, so the app must not go idle
+
 	uint live_vao;
 	uint live_vbo;
 	int live_capacity;
@@ -175,6 +180,7 @@ fn RLFont load_sdf_font(char[] ttf, CInt[] codepoints) @local
 
 fn void Renderer.init(&self)
 {
+	self.texture_budget = TEXTURE_BUDGET;
 	self.verts.init(mem);
 	self.flat.init(mem);
 	self.lines.init(mem);
@@ -213,7 +219,9 @@ fn void Renderer.begin_scene(&self, int width, int height)
 	self.width = width;
 	self.height = height;
 	self.stencil_ref = 0;
+	self.frame++;
 	self.textures_left = TEXTURES_PER_FRAME;
+	self.textures_waiting = false;
 	rl::gl_disable_backface_culling();
 	flush_batch();
 	gl_clear(GL_STENCIL_BUFFER_BIT);
@@ -354,6 +362,15 @@ fn void upload_picture(Asset* asset, RLImage* image)
 	asset.texture.set_filter(TRILINEAR);
 	asset.texture.set_wrap(CLAMP);
 	asset.state = READY;
+	asset.texture_bytes = (long)asset.texture.width * asset.texture.height * 4 * 4 / 3; // RGBA and its mipmaps
+}
+
+// The picture loads again from the asset's own bytes the next time it is drawn.
+fn void drop_texture(Asset* asset)
+{
+	rl::unload_texture(asset.texture);
+	asset.texture = {};
+	asset.state = UNLOADED;
 }
 
 <*
@@ -383,7 +400,11 @@ fn void orient_image(RLImage* image, int orientation)
 fn void Renderer.ensure_texture(&self, Asset* asset)
 {
 	if (asset.state != UNLOADED) return;
-	if (!self.load_all_textures && self.textures_left <= 0) return;
+	if (!self.load_all_textures && self.textures_left <= 0)
+	{
+		self.textures_waiting = true;
+		return;
+	}
 	self.textures_left--;
 	@pool()
 	{
@@ -403,6 +424,7 @@ fn void Renderer.draw_image(&self, Camera* cam, Item* item)
 {
 	self.end_ink();
 	Asset* asset = item.asset;
+	asset.last_drawn = self.frame;
 	self.ensure_texture(asset);
 	Vec2 p = cam.to_screen(item.pos);
 	float s = (float)(item.scale * cam.zoom);

@@ -27,7 +27,8 @@ struct Input
 	bool[KEY_COUNT] pressed; // includes key repeat
 	bool[KEY_COUNT] first_press; // does not
 	bool[KEY_COUNT] down;
-	bool[26] letters; // by the letter printed on the key
+	bool[26] letters; // by the letter printed on the key, includes key repeat
+	bool[26] first_letters; // does not
 	int[32] chars;
 	int char_count;
 	Sample[TRAIL_MAX] trail; // every pointer position since the last frame
@@ -62,6 +63,7 @@ fn void hook_pointer_trail()
 fn void read_letters(Input* in) @local
 {
 	in.letters = {};
+	in.first_letters = {};
 	for (int key = (int)RLKeyboardKey.A; key <= (int)RLKeyboardKey.Z; key++)
 	{
 		if (!in.pressed[key]) continue;
@@ -71,7 +73,9 @@ fn void read_letters(Input* in) @local
 		char letter = name ? name[0] : 0;
 		if (letter >= 'A' && letter <= 'Z') letter += 'a' - 'A';
 		bool latin = letter >= 'a' && letter <= 'z' && name[1] == 0;
-		in.letters[latin ? letter - 'a' : key - (int)RLKeyboardKey.A] = true;
+		int index = latin ? letter - 'a' : key - (int)RLKeyboardKey.A;
+		in.letters[index] = true;
+		if (in.first_press[key]) in.first_letters[index] = true;
 	}
 }
 
@@ -115,3 +119,4 @@ fn bool Input.key(&self, RLKeyboardKey key) => self.pressed[(int)key];
 fn bool Input.tapped(&self, RLKeyboardKey key) => self.first_press[(int)key];
 fn bool Input.held(&self, RLKeyboardKey key) => self.down[(int)key];
 fn bool Input.letter(&self, char c) => self.letters[c - 'a'];
+fn bool Input.letter_tapped(&self, char c) => self.first_letters[c - 'a'];
